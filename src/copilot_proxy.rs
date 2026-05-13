@@ -12,6 +12,15 @@ pub struct ProxyHandle {
     _task: JoinHandle<()>,
 }
 
+enum ProxyResponse {
+    Buffered(Vec<u8>),
+    Stream {
+        status: u16,
+        content_type: String,
+        response: reqwest::Response,
+    },
+}
+
 #[derive(Clone)]
 struct ProxyState {
     refresh_token: String,
@@ -86,54 +95,70 @@ async fn start_proxy(
 async fn handle_connection(mut stream: TcpStream, state: Arc<ProxyState>) -> Result<()> {
     let request = read_http_request(&mut stream).await?;
     let response = route_request(&request, &state).await;
-    let bytes = match response {
-        Ok(response) => response,
-        Err(err) => http_json(
-            500,
-            &json!({
-                "error": {
-                    "message": err.to_string(),
-                    "type": "swcli_github_copilot_proxy_error"
-                }
-            }),
-        ),
-    };
-    stream.write_all(&bytes).await?;
+    match response {
+        Ok(ProxyResponse::Buffered(response)) => {
+            stream.write_all(&response).await?;
+        }
+        Ok(ProxyResponse::Stream {
+            status,
+            content_type,
+            mut response,
+        }) => {
+            stream
+                .write_all(&http_stream_head(status, &content_type))
+                .await?;
+            while let Some(chunk) = response.chunk().await? {
+                stream.write_all(&chunk).await?;
+            }
+        }
+        Err(err) => {
+            let bytes = http_json(
+                500,
+                &json!({
+                    "error": {
+                        "message": err.to_string(),
+                        "type": "swcli_github_copilot_proxy_error"
+                    }
+                }),
+            );
+            stream.write_all(&bytes).await?;
+        }
+    }
     Ok(())
 }
 
-async fn route_request(request: &HttpRequest, state: &ProxyState) -> Result<Vec<u8>> {
+async fn route_request(request: &HttpRequest, state: &ProxyState) -> Result<ProxyResponse> {
     match state.mode {
         ProxyMode::OpenaiResponses => match request.path.as_str() {
             "/responses" | "/v1/responses" => {
                 forward_json(state, "/responses", request, false).await
             }
-            "/models" | "/v1/models" => Ok(http_json(
+            "/models" | "/v1/models" => Ok(ProxyResponse::Buffered(http_json(
                 200,
                 &responses_router::codex_models_response(state.model.as_ref()),
-            )),
-            _ => Ok(http_json(
+            ))),
+            _ => Ok(ProxyResponse::Buffered(http_json(
                 404,
                 &json!({"error": {"message": format!("Unsupported proxy path {}", request.path)}}),
-            )),
+            ))),
         },
         ProxyMode::OpenaiChat => match request.path.as_str() {
             "/chat/completions" | "/v1/chat/completions" => {
                 forward_json(state, "/chat/completions", request, false).await
             }
-            _ => Ok(http_json(
+            _ => Ok(ProxyResponse::Buffered(http_json(
                 404,
                 &json!({"error": {"message": format!("Unsupported proxy path {}", request.path)}}),
-            )),
+            ))),
         },
         ProxyMode::AnthropicMessages => match request.path.as_str() {
             "/messages" | "/v1/messages" => {
                 forward_json(state, "/v1/messages", request, true).await
             }
-            _ => Ok(http_json(
+            _ => Ok(ProxyResponse::Buffered(http_json(
                 404,
                 &json!({"error": {"message": format!("Unsupported proxy path {}", request.path)}}),
-            )),
+            ))),
         },
     }
 }
@@ -143,7 +168,7 @@ async fn forward_json(
     upstream_path: &str,
     request: &HttpRequest,
     anthropic: bool,
-) -> Result<Vec<u8>> {
+) -> Result<ProxyResponse> {
     let body = if request.body.is_empty() {
         None
     } else {
@@ -178,8 +203,19 @@ async fn forward_json(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    if is_event_stream(&content_type) {
+        return Ok(ProxyResponse::Stream {
+            status,
+            content_type,
+            response,
+        });
+    }
     let body = response.text().await.unwrap_or_default();
-    Ok(http_text(status, &content_type, body))
+    Ok(ProxyResponse::Buffered(http_text(
+        status,
+        &content_type,
+        body,
+    )))
 }
 
 fn endpoint_url(base_url: &str, path: &str) -> String {
@@ -277,6 +313,25 @@ fn http_text(status: u16, content_type: &str, body: impl Into<String>) -> Vec<u8
     .into_bytes()
 }
 
+fn http_stream_head(status: u16, content_type: &str) -> Vec<u8> {
+    let status_text = match status {
+        200 => "OK",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Upstream",
+    };
+    format!(
+        "HTTP/1.1 {status} {status_text}\r\ncontent-type: {content_type}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .to_ascii_lowercase()
+        .starts_with("text/event-stream")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +346,12 @@ mod tests {
             endpoint_url("http://127.0.0.1:1234/v1", "/v1/chat/completions"),
             "http://127.0.0.1:1234/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn detects_event_stream_content_type() {
+        assert!(is_event_stream("text/event-stream"));
+        assert!(is_event_stream("text/event-stream; charset=utf-8"));
+        assert!(!is_event_stream("application/json"));
     }
 }

@@ -1,4 +1,4 @@
-use crate::WireProtocol;
+use crate::provider::WireProtocol;
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
