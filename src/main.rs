@@ -194,12 +194,6 @@ struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     oauth_token: Option<String>,
     #[serde(
-        rename = "opencodeProviderId",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    opencode_provider_id: Option<String>,
-    #[serde(
         rename = "presetAlias",
         default,
         skip_serializing_if = "Option::is_none"
@@ -567,9 +561,17 @@ async fn add_key(store: &mut Store, args: KeysArgs) -> Result<()> {
         .or_else(|| preset.map(|p| p.endpoint.to_string()))
         .unwrap_or_else(|| default_base_url(provider).to_string());
     let secret = add.key.take().map(|s| encode_secret(&s));
-    let oauth_token = add.oauth_token.take().map(|s| encode_secret(&s));
-    let opencode_provider_id = preset.and_then(|p| p.opencode_provider_id);
-    if secret.is_none() && oauth_token.is_none() && opencode_provider_id.is_none() {
+    let mut oauth_token = add.oauth_token.take().map(|s| encode_secret(&s));
+    if preset.map(|p| p.alias) == Some("github-copilot") && oauth_token.is_none() {
+        if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+            bail!(
+                "Missing GitHub Copilot login. Run `swcli keys add {name} --preset github-copilot` interactively to complete device login."
+            );
+        }
+        let token = github_copilot::device_flow_login().await?;
+        oauth_token = Some(encode_secret(&token));
+    }
+    if secret.is_none() && oauth_token.is_none() {
         bail!(
             "Missing credential. Pass --key/--oauth-token or run `swcli keys add` interactively."
         );
@@ -597,7 +599,6 @@ async fn add_key(store: &mut Store, args: KeysArgs) -> Result<()> {
         wire: Some(wire),
         secret,
         oauth_token,
-        opencode_provider_id: opencode_provider_id.map(str::to_string),
         preset_alias: preset.map(|p| p.alias.to_string()),
         models_dev_provider_name: catalog_provider.map(|p| p.name.clone()),
         created_at: Utc::now(),
@@ -636,7 +637,7 @@ fn should_prompt_for_key_add(args: &KeysArgs) -> bool {
 }
 
 fn is_github_copilot_key(key: &ApiKey) -> bool {
-    key.opencode_provider_id.as_deref() == Some("github-copilot")
+    key.preset_alias.as_deref() == Some("github-copilot")
 }
 
 fn prompt_add_key(mut args: KeysArgs) -> Result<KeysArgs> {
@@ -675,9 +676,7 @@ fn prompt_add_key(mut args: KeysArgs) -> Result<KeysArgs> {
     }
 
     if let Some(alias) = args.preset.as_deref()
-        && resolve_builtin_preset(alias)?
-            .opencode_provider_id
-            .is_some()
+        && alias == "github-copilot"
     {
         return Ok(args);
     }
@@ -826,7 +825,6 @@ async fn cat_key(store: &Store, args: KeysArgs) -> Result<()> {
         "wire": key.wire_protocol(),
         "presetAlias": key.preset_alias,
         "modelsDevProviderName": key.models_dev_provider_name,
-        "opencodeProviderId": key.opencode_provider_id,
         "active": store.config.active_key_id.as_deref() == Some(&key.id),
         "hasSecret": key.secret.is_some(),
         "hasOAuthToken": key.oauth_token.is_some(),
@@ -855,7 +853,6 @@ async fn list_keys(store: &Store, with_ping: bool, json_output: bool) -> Result<
             "baseUrl": key.base_url,
             "presetAlias": key.preset_alias,
             "modelsDevProviderName": key.models_dev_provider_name,
-            "opencodeProviderId": key.opencode_provider_id,
             "active": store.config.active_key_id.as_deref() == Some(&key.id),
             "ping": ping,
         }));
@@ -950,8 +947,8 @@ async fn handle_models(store: &mut Store, args: ModelsArgs) -> Result<()> {
         Some(q) => store.resolve_key(q)?,
         None => store.active_key()?,
     };
-    if let Some(provider_id) = key.opencode_provider_id.as_deref() {
-        return handle_models_from_github_copilot(provider_id, &key, &args).await;
+    if is_github_copilot_key(&key) {
+        return handle_models_from_github_copilot(&key, &args).await;
     }
     if let Some(provider_name) = key.models_dev_provider_name.as_deref() {
         return handle_models_from_models_dev(store, &key, provider_name, &args).await;
@@ -1009,12 +1006,16 @@ async fn handle_models(store: &mut Store, args: ModelsArgs) -> Result<()> {
 }
 
 async fn fetch_models(key: &ApiKey) -> Result<Vec<String>> {
-    if let Some(provider_id) = key.opencode_provider_id.as_deref() {
-        return Ok(github_copilot::fetch_models(provider_id)
-            .await?
-            .into_iter()
-            .map(|model| model.id)
-            .collect());
+    if is_github_copilot_key(key) {
+        return Ok(github_copilot::fetch_models(
+            &key.plain_oauth_token()?,
+            Some(&key.base_url),
+            None,
+        )
+        .await?
+        .into_iter()
+        .map(|model| model.id)
+        .collect());
     }
     let url = models_url(key);
     let token = key.plain_secret()?;
@@ -1041,12 +1042,9 @@ async fn fetch_models(key: &ApiKey) -> Result<Vec<String>> {
     Ok(models)
 }
 
-async fn handle_models_from_github_copilot(
-    provider_id: &str,
-    key: &ApiKey,
-    args: &ModelsArgs,
-) -> Result<()> {
-    let mut models = github_copilot::fetch_models(provider_id).await?;
+async fn handle_models_from_github_copilot(key: &ApiKey, args: &ModelsArgs) -> Result<()> {
+    let mut models =
+        github_copilot::fetch_models(&key.plain_oauth_token()?, Some(&key.base_url), None).await?;
     let query = args.search.as_ref().map(|s| s.to_ascii_lowercase());
     models.retain(|model| {
         query
@@ -1064,7 +1062,6 @@ async fn handle_models_from_github_copilot(
             serde_json::to_string_pretty(&json!({
                 "provider": key.provider,
                 "baseUrl": key.base_url,
-                "opencodeProviderId": provider_id,
                 "models": models.iter().map(|model| json!({
                     "id": model.id,
                     "name": model.name,
@@ -1293,7 +1290,6 @@ struct BuiltinPreset {
     models_dev_provider_name: Option<&'static str>,
     endpoint: &'static str,
     wire: WireProtocol,
-    opencode_provider_id: Option<&'static str>,
 }
 
 const BUILTIN_PRESETS: &[BuiltinPreset] = &[
@@ -1303,7 +1299,6 @@ const BUILTIN_PRESETS: &[BuiltinPreset] = &[
         models_dev_provider_name: None,
         endpoint: "https://api.githubcopilot.com",
         wire: WireProtocol::OpenaiCompletions,
-        opencode_provider_id: Some("github-copilot"),
     },
     BuiltinPreset {
         alias: "minimax",
@@ -1311,7 +1306,6 @@ const BUILTIN_PRESETS: &[BuiltinPreset] = &[
         models_dev_provider_name: Some("MiniMax (minimax.io)"),
         endpoint: "https://api.minimax.io/anthropic/v1",
         wire: WireProtocol::AnthropicMessages,
-        opencode_provider_id: None,
     },
     BuiltinPreset {
         alias: "minimax-cn",
@@ -1319,7 +1313,6 @@ const BUILTIN_PRESETS: &[BuiltinPreset] = &[
         models_dev_provider_name: Some("MiniMax (minimaxi.com)"),
         endpoint: "https://api.minimaxi.com/anthropic/v1",
         wire: WireProtocol::AnthropicMessages,
-        opencode_provider_id: None,
     },
     BuiltinPreset {
         alias: "xiaomi-token-plan-cn",
@@ -1327,7 +1320,6 @@ const BUILTIN_PRESETS: &[BuiltinPreset] = &[
         models_dev_provider_name: Some("Xiaomi Token Plan (China)"),
         endpoint: "https://token-plan-cn.xiaomimimo.com/v1",
         wire: WireProtocol::OpenaiCompletions,
-        opencode_provider_id: None,
     },
 ];
 
@@ -1350,8 +1342,8 @@ async fn resolve_launch_model(
     key: &ApiKey,
     args: &mut LaunchArgs,
 ) -> Result<Option<ResolvedModel>> {
-    if let Some(provider_id) = key.opencode_provider_id.as_deref() {
-        return resolve_github_copilot_launch_model(provider_id, args)
+    if is_github_copilot_key(key) {
+        return resolve_github_copilot_launch_model(key, args)
             .await
             .map(Some);
     }
@@ -1415,10 +1407,11 @@ fn resolved_model_from(model: &ModelsDevModel, wire: WireProtocol) -> ResolvedMo
 }
 
 async fn resolve_github_copilot_launch_model(
-    provider_id: &str,
+    key: &ApiKey,
     args: &mut LaunchArgs,
 ) -> Result<ResolvedModel> {
-    let models = github_copilot::fetch_models(provider_id).await?;
+    let models =
+        github_copilot::fetch_models(&key.plain_oauth_token()?, Some(&key.base_url), None).await?;
     let resolved = match args.model.as_deref() {
         Some(model) => resolve_github_copilot_model(&models, model)?,
         None if io::stdin().is_terminal() => {
@@ -1592,17 +1585,13 @@ async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<()> {
             launch_base_url = "http://127.0.0.1:<swcli-github-copilot-router>/v1".to_string();
             None
         } else {
-            let provider_id = key.opencode_provider_id.clone().ok_or_else(|| {
-                anyhow!(
-                    "GitHub Copilot key `{}` is missing opencodeProviderId.",
-                    key.name
-                )
-            })?;
+            let refresh_token = key.plain_oauth_token()?;
             let router = match tool {
                 Tool::Codex => match effective_wire {
                     WireProtocol::OpenaiResponses => {
                         let proxy = copilot_proxy::start_openai_responses_proxy(
-                            provider_id,
+                            refresh_token.clone(),
+                            key.base_url.clone(),
                             router_model.clone(),
                         )
                         .await?;
@@ -1611,7 +1600,11 @@ async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<()> {
                         None
                     }
                     WireProtocol::OpenaiCompletions => {
-                        let proxy = copilot_proxy::start_openai_chat_proxy(provider_id).await?;
+                        let proxy = copilot_proxy::start_openai_chat_proxy(
+                            refresh_token.clone(),
+                            key.base_url.clone(),
+                        )
+                        .await?;
                         let proxy_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
                         let router = responses_router::start_openai_chat_responses_router(
                             proxy_base_url,
@@ -1623,8 +1616,11 @@ async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<()> {
                         Some(router)
                     }
                     WireProtocol::AnthropicMessages => {
-                        let proxy =
-                            copilot_proxy::start_anthropic_messages_proxy(provider_id).await?;
+                        let proxy = copilot_proxy::start_anthropic_messages_proxy(
+                            refresh_token.clone(),
+                            key.base_url.clone(),
+                        )
+                        .await?;
                         let proxy_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
                         let router = responses_router::start_anthropic_responses_router(
                             proxy_base_url,
@@ -1637,7 +1633,11 @@ async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<()> {
                     }
                 },
                 Tool::Claude => {
-                    let proxy = copilot_proxy::start_anthropic_messages_proxy(provider_id).await?;
+                    let proxy = copilot_proxy::start_anthropic_messages_proxy(
+                        refresh_token,
+                        key.base_url.clone(),
+                    )
+                    .await?;
                     launch_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
                     _copilot_proxy = Some(proxy);
                     None
@@ -1946,6 +1946,13 @@ impl ApiKey {
         self.wire.unwrap_or_else(|| infer_key_wire(self))
     }
 
+    fn plain_oauth_token(&self) -> Result<String> {
+        self.oauth_token
+            .as_ref()
+            .ok_or_else(|| anyhow!("Key `{}` has no OAuth token.", self.name))
+            .and_then(|s| decode_secret(s))
+    }
+
     fn plain_secret(&self) -> Result<String> {
         self.secret
             .as_ref()
@@ -2102,7 +2109,6 @@ mod tests {
             wire: Some(WireProtocol::OpenaiResponses),
             secret: Some(encode_secret("sk-test")),
             oauth_token: None,
-            opencode_provider_id: None,
             preset_alias: None,
             models_dev_provider_name: None,
             created_at: Utc::now(),
@@ -2131,10 +2137,9 @@ mod tests {
     }
 
     #[test]
-    fn resolves_builtin_github_copilot_to_opencode_auth_provider() {
+    fn resolves_builtin_github_copilot_preset() {
         let preset = resolve_builtin_preset("github-copilot").unwrap();
         assert_eq!(preset.models_dev_provider_name, None);
-        assert_eq!(preset.opencode_provider_id, Some("github-copilot"));
         assert_eq!(preset.endpoint, "https://api.githubcopilot.com");
     }
 

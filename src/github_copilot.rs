@@ -1,14 +1,14 @@
 use crate::WireProtocol;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::env;
-use std::path::PathBuf;
 
 const API_VERSION: &str = "2025-05-01";
-const TOKEN_REFRESH_BUFFER_MS: i64 = 5 * 60 * 1000;
+const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+const OAUTH_SCOPES: &str = "read:user";
+const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
 #[derive(Debug, Clone)]
 pub struct GithubCopilotSession {
@@ -26,37 +26,29 @@ pub struct GithubCopilotModel {
 }
 
 #[derive(Debug, Deserialize)]
-struct AuthEntry {
-    #[serde(rename = "type")]
-    kind: String,
-    refresh: String,
-    #[serde(default)]
-    access: Option<String>,
-    #[serde(default)]
-    expires: Option<i64>,
-    #[serde(rename = "enterpriseUrl", default)]
-    enterprise_url: Option<String>,
-    #[serde(rename = "baseUrl", default)]
-    base_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EntitlementResponse {
-    #[serde(default)]
-    endpoints: EntitlementEndpoints,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct EntitlementEndpoints {
-    #[serde(default)]
-    api: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct TokenResponse {
     token: String,
     #[serde(rename = "expires_at")]
     _expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default = "default_poll_interval_secs")]
+    interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceAccessTokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,22 +96,24 @@ struct LiveSupports {
     reasoning_effort: Option<Vec<String>>,
 }
 
-pub async fn resolve_session(provider_id: &str) -> Result<GithubCopilotSession> {
-    let info = load_auth_entry(provider_id)?;
-    if info.kind != "oauth" {
-        bail!("opencode auth entry `{provider_id}` is not an oauth provider");
-    }
-
-    let base_url = resolve_base_url(&info).await?;
-    let access_token = resolve_access_token(&info).await?;
-    Ok(GithubCopilotSession {
-        base_url,
-        access_token,
-    })
+pub async fn resolve_session(
+    refresh_token: &str,
+    base_url: Option<&str>,
+    enterprise_url: Option<&str>,
+) -> Result<GithubCopilotSession> {
+    let domain = normalize_domain(enterprise_url.unwrap_or("github.com"));
+    let base_url = base_url
+        .map(str::to_string)
+        .unwrap_or_else(|| "https://api.githubcopilot.com".to_string());
+    exchange_copilot_token(refresh_token, &base_url, Some(&domain)).await
 }
 
-pub async fn fetch_models(provider_id: &str) -> Result<Vec<GithubCopilotModel>> {
-    let session = resolve_session(provider_id).await?;
+pub async fn fetch_models(
+    refresh_token: &str,
+    base_url: Option<&str>,
+    enterprise_url: Option<&str>,
+) -> Result<Vec<GithubCopilotModel>> {
+    let session = resolve_session(refresh_token, base_url, enterprise_url).await?;
     let response = Client::new()
         .get(endpoint_url(&session.base_url, "/models"))
         .headers(model_headers(&session.access_token))
@@ -132,6 +126,36 @@ pub async fn fetch_models(provider_id: &str) -> Result<Vec<GithubCopilotModel>> 
         bail!("GitHub Copilot models request failed with {status}: {body}");
     }
     Ok(parse_models_response(body)?)
+}
+
+pub async fn device_flow_login() -> Result<String> {
+    let client = Client::new();
+    let response = client
+        .post(DEVICE_CODE_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .headers(vscode_headers())
+        .json(&serde_json::json!({
+            "client_id": CLIENT_ID,
+            "scope": OAUTH_SCOPES,
+        }))
+        .send()
+        .await
+        .context("Failed to request GitHub device code")?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| Value::Null);
+    if !status.is_success() {
+        bail!("GitHub device code request failed with {status}: {body}");
+    }
+    let device: DeviceCodeResponse =
+        serde_json::from_value(body).context("Invalid GitHub device code response")?;
+
+    eprintln!(
+        "GitHub Copilot login: visit {} and enter code {}",
+        device.verification_uri, device.user_code
+    );
+
+    poll_for_device_access_token(&client, &device).await
 }
 
 pub fn conversation_headers(access_token: &str, body: Option<&Value>) -> Vec<(String, String)> {
@@ -176,92 +200,6 @@ pub fn conversation_headers(access_token: &str, body: Option<&Value>) -> Vec<(St
     headers
 }
 
-fn load_auth_entry(provider_id: &str) -> Result<AuthEntry> {
-    let path = auth_path()?;
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let auth: BTreeMap<String, Value> = serde_json::from_str(&body)
-        .with_context(|| format!("Invalid JSON in {}", path.display()))?;
-    let entry = auth.get(provider_id).cloned().ok_or_else(|| {
-        anyhow!(
-            "No opencode auth entry `{provider_id}` in {}. Log in with opencode first.",
-            path.display()
-        )
-    })?;
-    serde_json::from_value(entry).with_context(|| {
-        format!(
-            "opencode auth entry `{provider_id}` in {} is not a supported GitHub Copilot oauth record",
-            path.display()
-        )
-    })
-}
-
-fn auth_path() -> Result<PathBuf> {
-    let home = env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("auth.json"))
-}
-
-async fn resolve_base_url(info: &AuthEntry) -> Result<String> {
-    if let Some(base_url) = &info.base_url {
-        return Ok(base_url.clone());
-    }
-    let Some(enterprise_url) = info.enterprise_url.as_deref() else {
-        return Ok("https://api.githubcopilot.com".to_string());
-    };
-    let domain = normalize_domain(enterprise_url);
-    let entitlement = Client::new()
-        .get(format!(
-            "https://{}/copilot_internal/user",
-            api_domain(&domain)
-        ))
-        .headers(base_headers(&info.refresh))
-        .send()
-        .await
-        .context("GitHub Copilot entitlement request failed")?;
-    let status = entitlement.status();
-    let body: Value = entitlement.json().await.unwrap_or_else(|_| Value::Null);
-    if !status.is_success() {
-        bail!("GitHub Copilot entitlement request failed with {status}: {body}");
-    }
-    let parsed: EntitlementResponse =
-        serde_json::from_value(body).context("Invalid GitHub Copilot entitlement response")?;
-    parsed
-        .endpoints
-        .api
-        .ok_or_else(|| anyhow!("GitHub Copilot entitlement response did not include endpoints.api"))
-}
-
-async fn resolve_access_token(info: &AuthEntry) -> Result<String> {
-    if let (Some(access), Some(expires)) = (&info.access, info.expires)
-        && expires - TOKEN_REFRESH_BUFFER_MS > now_ms()
-    {
-        return Ok(access.clone());
-    }
-
-    let domain = normalize_domain(info.enterprise_url.as_deref().unwrap_or("github.com"));
-    let response = Client::new()
-        .get(format!(
-            "https://{}/copilot_internal/v2/token",
-            api_domain(&domain)
-        ))
-        .headers(base_headers(&info.refresh))
-        .send()
-        .await
-        .context("GitHub Copilot token exchange failed")?;
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or_else(|_| Value::Null);
-    if !status.is_success() {
-        bail!("GitHub Copilot token exchange failed with {status}: {body}");
-    }
-    let parsed: TokenResponse =
-        serde_json::from_value(body).context("Invalid GitHub Copilot token response")?;
-    Ok(parsed.token)
-}
-
 fn parse_models_response(body: Value) -> Result<Vec<GithubCopilotModel>> {
     let parsed: ModelsResponse =
         serde_json::from_value(body).context("Invalid GitHub Copilot models response")?;
@@ -300,6 +238,77 @@ fn parse_models_response(body: Value) -> Result<Vec<GithubCopilotModel>> {
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
+}
+
+async fn poll_for_device_access_token(
+    client: &Client,
+    device: &DeviceCodeResponse,
+) -> Result<String> {
+    let mut interval = device.interval.max(1);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let response = client
+            .post(ACCESS_TOKEN_URL)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .headers(vscode_headers())
+            .json(&serde_json::json!({
+                "client_id": CLIENT_ID,
+                "device_code": device.device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            }))
+            .send()
+            .await
+            .context("Failed while polling GitHub device login")?;
+        let token_response: DeviceAccessTokenResponse = response
+            .json()
+            .await
+            .context("Invalid GitHub device access token response")?;
+        if let Some(access_token) = token_response.access_token {
+            return Ok(access_token);
+        }
+        match token_response.error.as_deref() {
+            Some("authorization_pending") => continue,
+            Some("slow_down") => {
+                interval = token_response
+                    .interval
+                    .unwrap_or(interval + 5)
+                    .max(interval + 1);
+            }
+            Some("expired_token") => bail!("GitHub device code expired. Please try again."),
+            Some("access_denied") => bail!("GitHub device login was denied."),
+            Some(error) => bail!("GitHub device login failed: {error}"),
+            None => continue,
+        }
+    }
+}
+
+async fn exchange_copilot_token(
+    refresh_token: &str,
+    base_url: &str,
+    domain: Option<&str>,
+) -> Result<GithubCopilotSession> {
+    let domain = domain.unwrap_or("github.com");
+    let response = Client::new()
+        .get(format!(
+            "https://{}/copilot_internal/v2/token",
+            api_domain(domain)
+        ))
+        .headers(base_headers(refresh_token))
+        .send()
+        .await
+        .context("GitHub Copilot token exchange failed")?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| Value::Null);
+    if !status.is_success() {
+        bail!("GitHub Copilot token exchange failed with {status}: {body}");
+    }
+    let parsed: TokenResponse =
+        serde_json::from_value(body).context("Invalid GitHub Copilot token response")?;
+    Ok(GithubCopilotSession {
+        base_url: base_url.to_string(),
+        access_token: parsed.token,
+    })
 }
 
 fn is_picker_model(model: &LiveModel) -> bool {
@@ -355,6 +364,12 @@ fn base_headers(token: &str) -> reqwest::header::HeaderMap {
         reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
             .expect("authorization header should be valid"),
     );
+    headers.extend(vscode_headers());
+    headers
+}
+
+fn vscode_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::USER_AGENT,
         reqwest::header::HeaderValue::from_static("GitHubCopilotChat/0.38.0"),
@@ -372,6 +387,10 @@ fn base_headers(token: &str) -> reqwest::header::HeaderMap {
         reqwest::header::HeaderValue::from_static("vscode-chat"),
     );
     headers
+}
+
+fn default_poll_interval_secs() -> u64 {
+    5
 }
 
 fn normalize_domain(url: &str) -> String {
@@ -398,10 +417,6 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
     } else {
         format!("{base}/{path}")
     }
-}
-
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 fn random_request_id() -> String {
@@ -564,5 +579,31 @@ mod tests {
         assert_eq!(models[1].context_window, Some(128000));
         assert_eq!(models[2].wire, WireProtocol::OpenaiResponses);
         assert_eq!(models[2].context_window, Some(400000));
+    }
+
+    #[test]
+    fn parses_device_code_response() {
+        let response: DeviceCodeResponse = serde_json::from_value(json!({
+            "device_code": "abc",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://github.com/login/device",
+            "interval": 8
+        }))
+        .unwrap();
+        assert_eq!(response.device_code, "abc");
+        assert_eq!(response.user_code, "ABCD-1234");
+        assert_eq!(response.verification_uri, "https://github.com/login/device");
+        assert_eq!(response.interval, 8);
+    }
+
+    #[test]
+    fn device_code_response_defaults_interval() {
+        let response: DeviceCodeResponse = serde_json::from_value(json!({
+            "device_code": "abc",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://github.com/login/device"
+        }))
+        .unwrap();
+        assert_eq!(response.interval, 5);
     }
 }

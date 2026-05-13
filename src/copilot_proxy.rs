@@ -14,7 +14,8 @@ pub struct ProxyHandle {
 
 #[derive(Clone)]
 struct ProxyState {
-    provider_id: String,
+    refresh_token: String,
+    base_url: String,
     mode: ProxyMode,
     model: Option<responses_router::RouterModelMetadata>,
     client: reqwest::Client,
@@ -28,29 +29,38 @@ enum ProxyMode {
 }
 
 pub async fn start_openai_responses_proxy(
-    provider_id: String,
+    refresh_token: String,
+    base_url: String,
     model: Option<responses_router::RouterModelMetadata>,
 ) -> Result<ProxyHandle> {
-    start_proxy(provider_id, ProxyMode::OpenaiResponses, model).await
+    start_proxy(refresh_token, base_url, ProxyMode::OpenaiResponses, model).await
 }
 
-pub async fn start_openai_chat_proxy(provider_id: String) -> Result<ProxyHandle> {
-    start_proxy(provider_id, ProxyMode::OpenaiChat, None).await
+pub async fn start_openai_chat_proxy(
+    refresh_token: String,
+    base_url: String,
+) -> Result<ProxyHandle> {
+    start_proxy(refresh_token, base_url, ProxyMode::OpenaiChat, None).await
 }
 
-pub async fn start_anthropic_messages_proxy(provider_id: String) -> Result<ProxyHandle> {
-    start_proxy(provider_id, ProxyMode::AnthropicMessages, None).await
+pub async fn start_anthropic_messages_proxy(
+    refresh_token: String,
+    base_url: String,
+) -> Result<ProxyHandle> {
+    start_proxy(refresh_token, base_url, ProxyMode::AnthropicMessages, None).await
 }
 
 async fn start_proxy(
-    provider_id: String,
+    refresh_token: String,
+    base_url: String,
     mode: ProxyMode,
     model: Option<responses_router::RouterModelMetadata>,
 ) -> Result<ProxyHandle> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     let state = Arc::new(ProxyState {
-        provider_id,
+        refresh_token,
+        base_url,
         mode,
         model,
         client: reqwest::Client::new(),
@@ -139,9 +149,10 @@ async fn forward_json(
     } else {
         Some(serde_json::from_slice::<Value>(&request.body).context("Invalid proxy request JSON")?)
     };
-    let session = github_copilot::resolve_session(&state.provider_id)
-        .await
-        .context("GitHub Copilot auth resolution failed")?;
+    let session =
+        github_copilot::resolve_session(&state.refresh_token, Some(&state.base_url), None)
+            .await
+            .context("GitHub Copilot auth resolution failed")?;
     let mut upstream = state
         .client
         .post(endpoint_url(&session.base_url, upstream_path));
