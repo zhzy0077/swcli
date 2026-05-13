@@ -19,6 +19,7 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
+mod responses_chat_bridge;
 mod responses_router;
 mod tui;
 
@@ -260,6 +261,7 @@ struct ResolvedModel {
     id: String,
     name: String,
     context_window: Option<u64>,
+    supports_reasoning: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -270,7 +272,7 @@ enum AddProviderChoice {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli(std::env::args_os())?;
     let mut store = Store::new()?;
     store.ensure_key_wires().await?;
 
@@ -279,6 +281,31 @@ async fn main() -> Result<()> {
         ParsedCommand::Keys(args) => handle_keys(&mut store, args).await,
         ParsedCommand::Models(args) => handle_models(&mut store, args).await,
     }
+}
+
+fn parse_cli<I, T>(args: I) -> Result<Cli>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let raw_args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    match find_dispatch_token(&raw_args) {
+        Some(DispatchToken::Tool(index)) => {
+            let mut cli = Cli::try_parse_from(raw_args[..=index].iter().cloned())?;
+            cli.tool_args = raw_args[index + 1..]
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            Ok(cli)
+        }
+        _ => Ok(Cli::try_parse_from(raw_args)?),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchToken {
+    Tool(usize),
+    Command,
 }
 
 #[derive(Debug)]
@@ -301,16 +328,20 @@ fn normalize_cli(cli: Cli) -> Result<ParsedCommand> {
     match cli.command {
         Some(Commands::Keys(args)) => Ok(ParsedCommand::Keys(args)),
         Some(Commands::Models(args)) => Ok(ParsedCommand::Models(args)),
-        None => Ok(ParsedCommand::Launch(LaunchArgs {
-            tool: cli
+        None => {
+            let tool = cli
                 .tool
-                .ok_or_else(|| anyhow!("Missing tool. Use `swcli <tool> [args...]`."))?,
-            tool_args: cli.tool_args,
-            model: cli.model,
-            key: cli.key,
-            dry_run: cli.dry_run,
-            envs: cli.envs,
-        })),
+                .ok_or_else(|| anyhow!("Missing tool. Use `swcli <tool> [args...]`."))?;
+
+            Ok(ParsedCommand::Launch(LaunchArgs {
+                tool,
+                tool_args: cli.tool_args,
+                model: cli.model,
+                key: cli.key,
+                dry_run: cli.dry_run,
+                envs: cli.envs,
+            }))
+        }
     }
 }
 
@@ -324,6 +355,28 @@ fn reject_launch_options_for_management(cli: &Cli, command_name: &str) -> Result
         bail!("Unexpected launch arguments for `swcli {command_name} ...`.");
     }
     Ok(())
+}
+
+fn find_dispatch_token(args: &[std::ffi::OsString]) -> Option<DispatchToken> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].to_string_lossy();
+        match arg.as_ref() {
+            "-k" | "--key" | "-m" | "--model" | "-e" | "--env" => index += 2,
+            "--dry-run" => index += 1,
+            "keys" | "models" => return Some(DispatchToken::Command),
+            "codex" | "claude" | "claude-code" => return Some(DispatchToken::Tool(index)),
+            _ if arg.starts_with("--key=")
+                || arg.starts_with("--model=")
+                || arg.starts_with("--env=") =>
+            {
+                index += 1;
+            }
+            _ if arg.starts_with('-') => index += 1,
+            _ => return None,
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -1259,7 +1312,16 @@ fn resolved_model_from(model: &ModelsDevModel) -> ResolvedModel {
         id: model.id.clone(),
         name: model.name.clone(),
         context_window: model_context_window(model),
+        supports_reasoning: model_supports_reasoning(model),
     }
+}
+
+fn model_supports_reasoning(model: &ModelsDevModel) -> bool {
+    model
+        .extra
+        .get("reasoning")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn model_context_window(model: &ModelsDevModel) -> Option<u64> {
@@ -1323,6 +1385,7 @@ async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<()> {
             id: model.id.clone(),
             name: model.name.clone(),
             context_window: model.context_window,
+            supports_reasoning: model.supports_reasoning,
         });
     let mut command = match tool {
         Tool::Codex => Command::new("codex"),
@@ -1726,7 +1789,7 @@ mod tests {
 
     #[test]
     fn parses_top_level_launch_and_passthrough_args() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "swcli",
             "-k",
             "minimax",
@@ -1748,7 +1811,7 @@ mod tests {
 
     #[test]
     fn parses_management_subcommand_without_launch_mode() {
-        let cli = Cli::try_parse_from(["swcli", "models", "--json"]).unwrap();
+        let cli = parse_cli(["swcli", "models", "--json"]).unwrap();
 
         match normalize_cli(cli).unwrap() {
             ParsedCommand::Models(args) => assert!(args.json),
@@ -1758,8 +1821,18 @@ mod tests {
 
     #[test]
     fn rejects_launch_flags_for_management_subcommands() {
-        let cli = Cli::try_parse_from(["swcli", "-k", "minimax", "models"]).unwrap();
+        let cli = parse_cli(["swcli", "-k", "minimax", "models"]).unwrap();
         assert!(normalize_cli(cli).is_err());
+    }
+
+    #[test]
+    fn passes_through_swcli_like_flags_after_tool_name() {
+        let cli = parse_cli(["swcli", "codex", "-k", "mimo"]).unwrap();
+        let ParsedCommand::Launch(args) = normalize_cli(cli).unwrap() else {
+            panic!("expected launch command");
+        };
+        assert_eq!(args.tool, "codex");
+        assert_eq!(args.tool_args, vec!["-k", "mimo"]);
     }
 
     #[test]
@@ -1833,6 +1906,7 @@ mod tests {
         assert_eq!(model.id, "MiniMax-M2.7");
         assert_eq!(model.name, "MiniMax M2.7");
         assert_eq!(model.extra["reasoning"], true);
+        assert!(resolved_model_from(model).supports_reasoning);
     }
 
     #[test]
@@ -1862,6 +1936,11 @@ mod tests {
         assert_eq!(
             resolve_model(provider, "MiniMax M2.7").unwrap().id,
             "MiniMax-M2.7"
+        );
+        assert!(
+            !resolve_model(provider, "MiniMax M2.7")
+                .unwrap()
+                .supports_reasoning
         );
         assert!(resolve_model(provider, "MiniMax-M2").is_err());
     }

@@ -1,3 +1,4 @@
+use crate::responses_chat_bridge;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ pub struct RouterModelMetadata {
     pub id: String,
     pub name: String,
     pub context_window: Option<u64>,
+    pub supports_reasoning: bool,
 }
 
 #[derive(Clone)]
@@ -36,6 +38,49 @@ struct RouterState {
 enum RouterTargetWire {
     OpenaiCompletions,
     AnthropicMessages,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl CanonicalEffort {
+    fn from_openai_str(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    fn to_anthropic_effort(self) -> &'static str {
+        match self {
+            Self::None | Self::Minimal | Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    fn to_anthropic_budget_tokens(self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::Minimal | Self::Low => Some(1024),
+            Self::Medium => Some(4096),
+            Self::High => Some(16384),
+            Self::Max => Some(32000),
+        }
+    }
 }
 
 pub async fn start_anthropic_responses_router(
@@ -156,6 +201,7 @@ async fn handle_responses(request: &HttpRequest, state: &RouterState) -> Result<
         RouterTargetWire::OpenaiCompletions => responses_to_openai_chat_request(
             &body,
             state.model.as_ref().map(|model| model.id.as_str()),
+            target_requires_reasoning_content(&state.target_base_url),
         ),
     };
     let upstream = match state.target_wire {
@@ -170,21 +216,28 @@ async fn handle_responses(request: &HttpRequest, state: &RouterState) -> Result<
         return Ok(http_text(status, "application/json", text));
     }
     let upstream_response: Value = upstream.json().await?;
-    let response = match state.target_wire {
-        RouterTargetWire::AnthropicMessages => {
-            anthropic_to_responses_response(&upstream_response, &original_model)
-        }
-        RouterTargetWire::OpenaiCompletions => {
-            openai_chat_to_responses_response(&upstream_response, &original_model)
-        }
-    };
     if stream {
-        Ok(http_text(
-            200,
-            "text/event-stream",
-            responses_response_to_sse(&response),
-        ))
+        let sse = match state.target_wire {
+            RouterTargetWire::AnthropicMessages => {
+                let response = anthropic_to_responses_response(&upstream_response, &original_model);
+                responses_response_to_sse(&response)
+            }
+            RouterTargetWire::OpenaiCompletions => openai_chat_to_responses_sse(
+                &upstream_response,
+                &original_model,
+                target_requires_reasoning_content(&state.target_base_url),
+            ),
+        };
+        Ok(http_text(200, "text/event-stream", sse))
     } else {
+        let response = match state.target_wire {
+            RouterTargetWire::AnthropicMessages => {
+                anthropic_to_responses_response(&upstream_response, &original_model)
+            }
+            RouterTargetWire::OpenaiCompletions => {
+                openai_chat_to_responses_response(&upstream_response, &original_model)
+            }
+        };
         Ok(http_json(200, &response))
     }
 }
@@ -204,12 +257,27 @@ async fn post_anthropic_messages(state: &RouterState, body: &Value) -> Result<re
 
 fn codex_model_info(model: &RouterModelMetadata) -> Value {
     let context_window = model.context_window.unwrap_or(272_000);
+    let default_reasoning_level = if model.supports_reasoning {
+        json!("medium")
+    } else {
+        Value::Null
+    };
+    let supported_reasoning_levels = if model.supports_reasoning {
+        json!([
+            {"effort": "low", "description": "low"},
+            {"effort": "medium", "description": "medium"},
+            {"effort": "high", "description": "high"},
+            {"effort": "xhigh", "description": "xhigh"}
+        ])
+    } else {
+        json!([])
+    };
     json!({
         "slug": model.id,
         "display_name": model.name,
         "description": null,
-        "default_reasoning_level": null,
-        "supported_reasoning_levels": [],
+        "default_reasoning_level": default_reasoning_level,
+        "supported_reasoning_levels": supported_reasoning_levels,
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
@@ -219,7 +287,7 @@ fn codex_model_info(model: &RouterModelMetadata) -> Value {
         "availability_nux": null,
         "upgrade": null,
         "base_instructions": CODEX_BASE_INSTRUCTIONS,
-        "supports_reasoning_summaries": false,
+        "supports_reasoning_summaries": model.supports_reasoning,
         "default_reasoning_summary": "none",
         "support_verbosity": false,
         "default_verbosity": null,
@@ -266,179 +334,23 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
     }
 }
 
-fn responses_to_openai_chat_request(body: &Value, actual_model: Option<&str>) -> Value {
-    let mut messages = Vec::new();
-    if let Some(instructions) = body.get("instructions").and_then(|value| value.as_str())
-        && !instructions.is_empty()
-    {
-        messages.push(json!({"role": "system", "content": instructions}));
-    }
-    if let Some(items) = body.get("input").and_then(|value| value.as_array()) {
-        for item in items {
-            match item.get("type").and_then(|value| value.as_str()) {
-                Some("message") => {
-                    let role = item
-                        .get("role")
-                        .and_then(|value| value.as_str())
-                        .filter(|role| matches!(*role, "system" | "user" | "assistant" | "tool"))
-                        .unwrap_or("user");
-                    messages.push(json!({
-                        "role": role,
-                        "content": responses_content_to_openai_chat_content(item.get("content"))
-                    }));
-                }
-                Some("function_call") => {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| item.get("id").and_then(|value| value.as_str()))
-                        .unwrap_or("call_0");
-                    let name = item
-                        .get("name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("{}");
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": call_id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": arguments}
-                        }]
-                    }));
-                }
-                Some("function_call_output") => {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("call_0");
-                    let output = item
-                        .get("output")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": output
-                    }));
-                }
-                None => {
-                    if let Some(text) = item.as_str() {
-                        messages.push(json!({"role": "user", "content": text}));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut req = json!({
-        "model": actual_model
-            .or_else(|| body.get("model").and_then(|value| value.as_str()))
-            .unwrap_or("model"),
-        "messages": messages,
-        "stream": false
-    });
-    if let Some(tools) = responses_tools_to_openai_chat_tools(body.get("tools")) {
-        req["tools"] = Value::Array(tools);
-    }
-    if let Some(tokens) = body
-        .get("max_output_tokens")
-        .or_else(|| body.get("max_tokens"))
-        .cloned()
-    {
-        req["max_tokens"] = tokens;
-    }
-    for field in ["temperature", "top_p"] {
-        if let Some(value) = body.get(field) {
-            req[field] = value.clone();
-        }
-    }
-    req
+fn responses_to_openai_chat_request(
+    body: &Value,
+    actual_model: Option<&str>,
+    requires_reasoning_content: bool,
+) -> Value {
+    responses_chat_bridge::convert_responses_to_openai_chat_request(
+        body,
+        actual_model,
+        requires_reasoning_content,
+    )
 }
 
-fn responses_content_to_openai_chat_content(content: Option<&Value>) -> Value {
-    match content {
-        Some(Value::String(text)) => Value::String(text.clone()),
-        Some(Value::Array(parts)) => {
-            let converted = parts
-                .iter()
-                .filter_map(responses_content_part_to_openai_chat_part)
-                .collect::<Vec<_>>();
-            if converted
-                .iter()
-                .all(|part| part.get("type").and_then(|value| value.as_str()) == Some("text"))
-            {
-                Value::String(
-                    converted
-                        .iter()
-                        .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            } else {
-                Value::Array(converted)
-            }
-        }
-        Some(Value::Object(object)) => Value::String(
-            object
-                .get("text")
-                .and_then(|value| value.as_str())
-                .or_else(|| object.get("content").and_then(|value| value.as_str()))
-                .unwrap_or("")
-                .to_string(),
-        ),
-        _ => Value::String(String::new()),
-    }
-}
-
-fn responses_content_part_to_openai_chat_part(part: &Value) -> Option<Value> {
-    if let Some(text) = part.as_str() {
-        return Some(json!({"type": "text", "text": text}));
-    }
-    match part.get("type").and_then(|value| value.as_str()) {
-        Some("input_text") | Some("output_text") | Some("text") | None => part
-            .get("text")
-            .and_then(|value| value.as_str())
-            .or_else(|| part.get("content").and_then(|value| value.as_str()))
-            .map(|text| json!({"type": "text", "text": text})),
-        Some("input_image") => part
-            .get("image_url")
-            .and_then(|value| match value {
-                Value::String(url) => Some(json!({"url": url})),
-                Value::Object(_) => Some(value.clone()),
-                _ => None,
-            })
-            .map(|image_url| json!({"type": "image_url", "image_url": image_url})),
-        _ => None,
-    }
-}
-
-fn responses_tools_to_openai_chat_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
-    let tools = tools?.as_array()?;
-    let converted = tools
-        .iter()
-        .filter(|tool| tool.get("type").and_then(|value| value.as_str()) == Some("function"))
-        .map(|tool| {
-            if tool.get("function").is_some() {
-                tool.clone()
-            } else {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name").cloned().unwrap_or_else(|| json!("")),
-                        "description": tool.get("description").cloned().unwrap_or_else(|| json!("")),
-                        "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}}))
-                    }
-                })
-            }
-        })
-        .collect::<Vec<_>>();
-    (!converted.is_empty()).then_some(converted)
+fn extract_responses_reasoning_effort(body: &Value) -> Option<CanonicalEffort> {
+    body.get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(|value| value.as_str())
+        .and_then(CanonicalEffort::from_openai_str)
 }
 
 fn responses_to_anthropic_request(body: &Value, actual_model: Option<&str>) -> Value {
@@ -449,16 +361,7 @@ fn responses_to_anthropic_request(body: &Value, actual_model: Option<&str>) -> V
         system.push(json!({"type": "text", "text": instructions}));
     }
 
-    let messages = body
-        .get("input")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(responses_input_item_to_anthropic_message)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let messages = responses_input_to_anthropic_messages(body.get("input"));
 
     let mut req = json!({
         "model": actual_model
@@ -479,7 +382,26 @@ fn responses_to_anthropic_request(body: &Value, actual_model: Option<&str>) -> V
             req[field] = value.clone();
         }
     }
+    if let Some(effort) = extract_responses_reasoning_effort(body) {
+        if let Some(budget_tokens) = effort.to_anthropic_budget_tokens() {
+            req["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget_tokens
+            });
+            ensure_anthropic_max_tokens_exceeds_thinking_budget(&mut req, budget_tokens);
+        }
+        req["output_config"] = json!({
+            "effort": effort.to_anthropic_effort()
+        });
+    }
     req
+}
+
+fn ensure_anthropic_max_tokens_exceeds_thinking_budget(req: &mut Value, budget_tokens: u64) {
+    let max_tokens = req.get("max_tokens").and_then(json_u64).unwrap_or(0);
+    if max_tokens <= budget_tokens {
+        req["max_tokens"] = json!(budget_tokens.saturating_add(1024));
+    }
 }
 
 fn response_max_tokens(body: &Value) -> u64 {
@@ -490,7 +412,36 @@ fn response_max_tokens(body: &Value) -> u64 {
         .unwrap_or(4096)
 }
 
-fn responses_input_item_to_anthropic_message(item: &Value) -> Option<Value> {
+fn responses_input_to_anthropic_messages(input: Option<&Value>) -> Vec<Value> {
+    let Some(items) = input.and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    let mut pending_thinking = Vec::new();
+    for item in items {
+        if item.get("type").and_then(|value| value.as_str()) == Some("reasoning") {
+            pending_thinking.extend(responses_reasoning_item_to_anthropic_blocks(item));
+            continue;
+        }
+        if let Some(message) =
+            responses_input_item_to_anthropic_message(item, &mut pending_thinking)
+        {
+            messages.push(message);
+        }
+    }
+    if !pending_thinking.is_empty() {
+        messages.push(json!({
+            "role": "assistant",
+            "content": pending_thinking
+        }));
+    }
+    messages
+}
+
+fn responses_input_item_to_anthropic_message(
+    item: &Value,
+    pending_thinking: &mut Vec<Value>,
+) -> Option<Value> {
     match item.get("type").and_then(|value| value.as_str()) {
         Some("message") => {
             let role = item
@@ -498,9 +449,13 @@ fn responses_input_item_to_anthropic_message(item: &Value) -> Option<Value> {
                 .and_then(|value| value.as_str())
                 .filter(|role| matches!(*role, "user" | "assistant"))
                 .unwrap_or("user");
+            let mut content = responses_content_to_anthropic_content(item.get("content"));
+            if role == "assistant" {
+                prepend_pending_thinking(&mut content, pending_thinking);
+            }
             Some(json!({
                 "role": role,
-                "content": responses_content_to_anthropic_content(item.get("content"))
+                "content": content
             }))
         }
         Some("function_call") => {
@@ -518,14 +473,16 @@ fn responses_input_item_to_anthropic_message(item: &Value) -> Option<Value> {
                 .and_then(|value| value.as_str())
                 .and_then(|args| serde_json::from_str::<Value>(args).ok())
                 .unwrap_or_else(|| json!({}));
+            let mut content = json!([{
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": input
+            }]);
+            prepend_pending_thinking(&mut content, pending_thinking);
             Some(json!({
                 "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": call_id,
-                    "name": name,
-                    "input": input
-                }]
+                "content": content
             }))
         }
         Some("function_call_output") => {
@@ -554,6 +511,83 @@ fn responses_input_item_to_anthropic_message(item: &Value) -> Option<Value> {
         }),
         _ => None,
     }
+}
+
+fn prepend_pending_thinking(content: &mut Value, pending_thinking: &mut Vec<Value>) {
+    if pending_thinking.is_empty() {
+        return;
+    }
+    let mut merged = std::mem::take(pending_thinking);
+    if let Some(blocks) = content.as_array_mut() {
+        merged.append(blocks);
+        *blocks = merged;
+    }
+}
+
+fn responses_reasoning_item_to_anthropic_blocks(item: &Value) -> Vec<Value> {
+    let mut blocks = responses_item_reasoning_content(item)
+        .into_iter()
+        .map(|text| json!({"type": "thinking", "thinking": text}))
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        blocks = item
+            .get("summary")
+            .and_then(|value| value.as_array())
+            .map(|summary| {
+                summary
+                    .iter()
+                    .filter_map(|part| {
+                        part.get("text")
+                            .and_then(|value| value.as_str())
+                            .filter(|text| !text.is_empty())
+                            .map(|text| json!({"type": "thinking", "thinking": text}))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+    blocks
+}
+
+fn responses_item_reasoning_content(item: &Value) -> Vec<String> {
+    if let Some(reasoning_content) = item
+        .get("reasoning_content")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+    {
+        return vec![reasoning_content.to_string()];
+    }
+    if let Some(encrypted_content) = item
+        .get("encrypted_content")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+    {
+        return vec![encrypted_content.to_string()];
+    }
+    item.get("content")
+        .and_then(|value| value.as_array())
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|part| {
+                    part.get("reasoning")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| {
+                            (part.get("type").and_then(|value| value.as_str())
+                                == Some("reasoning_text"))
+                            .then(|| part.get("text").and_then(|value| value.as_str()))
+                            .flatten()
+                        })
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn target_requires_reasoning_content(_base_url: &str) -> bool {
+    true
 }
 
 fn responses_content_to_anthropic_content(content: Option<&Value>) -> Value {
@@ -588,6 +622,11 @@ fn responses_content_part_to_anthropic_block(part: &Value) -> Option<Value> {
             .and_then(|value| value.as_str())
             .or_else(|| part.get("content").and_then(|value| value.as_str()))
             .map(|text| json!({"type": "text", "text": text})),
+        Some("reasoning") => part
+            .get("reasoning")
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.is_empty())
+            .map(|text| json!({"type": "thinking", "thinking": text})),
         _ => None,
     }
 }
@@ -658,9 +697,13 @@ fn openai_chat_choices_to_responses_output(choices: Option<&Value>) -> Vec<Value
         let Some(message) = choice.get("message") else {
             continue;
         };
+        let reasoning = extract_openai_message_reasoning_content(message);
         let text = extract_openai_message_text(message.get("content"));
         if !text.is_empty() {
-            output.push(message_output_item(&text));
+            output.push(message_output_item_with_reasoning(
+                &text,
+                reasoning.as_deref(),
+            ));
         }
         if let Some(tool_calls) = message.get("tool_calls").and_then(|value| value.as_array()) {
             for tool_call in tool_calls {
@@ -678,14 +721,21 @@ fn openai_chat_choices_to_responses_output(choices: Option<&Value>) -> Vec<Value
                     .and_then(|function| function.get("arguments"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("{}");
-                output.push(json!({
+                let mut item = json!({
                     "id": gen_id("fc"),
                     "type": "function_call",
                     "status": "completed",
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments
-                }));
+                });
+                if let Some(reasoning) = reasoning
+                    .as_deref()
+                    .filter(|reasoning| !reasoning.is_empty())
+                {
+                    item["reasoning_content"] = json!(reasoning);
+                }
+                output.push(item);
             }
         }
     }
@@ -693,6 +743,15 @@ fn openai_chat_choices_to_responses_output(choices: Option<&Value>) -> Vec<Value
         output.push(message_output_item(""));
     }
     output
+}
+
+fn extract_openai_message_reasoning_content(message: &Value) -> Option<String> {
+    message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 fn extract_openai_message_text(content: Option<&Value>) -> String {
@@ -723,9 +782,21 @@ fn anthropic_content_to_responses_output(content: Option<&Value>) -> Vec<Value> 
     };
 
     let mut text = String::new();
+    let mut reasoning_parts = Vec::new();
     let mut output = Vec::new();
     for block in blocks {
         match block.get("type").and_then(|value| value.as_str()) {
+            Some("thinking") | Some("reasoning") => {
+                if let Some(thinking) = block
+                    .get("thinking")
+                    .or_else(|| block.get("reasoning"))
+                    .or_else(|| block.get("text"))
+                    .and_then(|value| value.as_str())
+                    .filter(|thinking| !thinking.is_empty())
+                {
+                    reasoning_parts.push(thinking.to_string());
+                }
+            }
             Some("text") => {
                 if let Some(part) = block.get("text").and_then(|value| value.as_str()) {
                     text.push_str(part);
@@ -733,8 +804,12 @@ fn anthropic_content_to_responses_output(content: Option<&Value>) -> Vec<Value> 
             }
             Some("tool_use") => {
                 if !text.is_empty() {
-                    output.push(message_output_item(&text));
+                    output.push(message_output_item_with_reasoning(
+                        &text,
+                        joined_reasoning(&reasoning_parts).as_deref(),
+                    ));
                     text.clear();
+                    reasoning_parts.clear();
                 }
                 let call_id = block
                     .get("id")
@@ -748,36 +823,66 @@ fn anthropic_content_to_responses_output(content: Option<&Value>) -> Vec<Value> 
                     .get("input")
                     .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()))
                     .unwrap_or_else(|| "{}".to_string());
-                output.push(json!({
+                let mut item = json!({
                     "id": gen_id("fc"),
                     "type": "function_call",
                     "status": "completed",
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments
-                }));
+                });
+                attach_reasoning_content_to_item(&mut item, &reasoning_parts);
+                reasoning_parts.clear();
+                output.push(item);
             }
             _ => {}
         }
     }
     if !text.is_empty() || output.is_empty() {
-        output.push(message_output_item(&text));
+        output.push(message_output_item_with_reasoning(
+            &text,
+            joined_reasoning(&reasoning_parts).as_deref(),
+        ));
     }
     output
 }
 
+fn joined_reasoning(reasoning_parts: &[String]) -> Option<String> {
+    (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n"))
+}
+
+fn attach_reasoning_content_to_item(item: &mut Value, reasoning_parts: &[String]) {
+    if let Some(reasoning) = joined_reasoning(reasoning_parts) {
+        item["reasoning_content"] = json!(reasoning);
+    }
+}
+
 fn message_output_item(text: &str) -> Value {
-    json!({
+    message_output_item_with_reasoning(text, None)
+}
+
+fn message_output_item_with_reasoning(text: &str, reasoning: Option<&str>) -> Value {
+    let mut content = vec![json!({
+        "type": "output_text",
+        "text": text,
+        "annotations": []
+    })];
+    let mut item = json!({
         "id": gen_id("msg"),
         "type": "message",
         "status": "completed",
         "role": "assistant",
-        "content": [{
-            "type": "output_text",
-            "text": text,
-            "annotations": []
-        }]
-    })
+        "content": content
+    });
+    if let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) {
+        content.push(json!({
+            "type": "reasoning",
+            "reasoning": reasoning
+        }));
+        item["reasoning_content"] = json!(reasoning);
+    }
+    item["content"] = json!(content);
+    item
 }
 
 fn openai_usage_to_responses_usage(usage: Option<&Value>) -> Option<Value> {
@@ -815,6 +920,18 @@ fn openai_usage_to_responses_usage(usage: Option<&Value>) -> Option<Value> {
         },
         "total_tokens": total_tokens
     }))
+}
+
+fn openai_chat_to_responses_sse(
+    chat: &Value,
+    original_model: &str,
+    requires_reasoning_content: bool,
+) -> String {
+    responses_chat_bridge::convert_openai_chat_response_to_responses_sse(
+        chat,
+        original_model,
+        requires_reasoning_content,
+    )
 }
 
 fn anthropic_usage_to_responses_usage(usage: Option<&Value>) -> Option<Value> {
@@ -895,6 +1012,9 @@ fn push_output_item_sse(sse: &mut String, response_id: &str, index: usize, item:
             let mut added = item.clone();
             added["status"] = json!("in_progress");
             added["arguments"] = json!("");
+            if let Some(object) = added.as_object_mut() {
+                object.remove("reasoning_content");
+            }
             sse.push_str(&sse_event(
                 "response.output_item.added",
                 &json!({
@@ -946,6 +1066,21 @@ fn push_output_item_sse(sse: &mut String, response_id: &str, index: usize, item:
                 .and_then(|part| part.get("text"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
+            let reasoning = item
+                .get("content")
+                .and_then(|value| value.as_array())
+                .and_then(|parts| {
+                    parts.iter().find_map(|part| {
+                        match part.get("type").and_then(|value| value.as_str()) {
+                            Some("reasoning") => part
+                                .get("reasoning")
+                                .or_else(|| part.get("text"))
+                                .and_then(|value| value.as_str()),
+                            _ => None,
+                        }
+                    })
+                })
+                .filter(|value| !value.is_empty());
             let mut added = item.clone();
             added["status"] = json!("in_progress");
             added["content"] = json!([]);
@@ -1004,6 +1139,30 @@ fn push_output_item_sse(sse: &mut String, response_id: &str, index: usize, item:
                     "part": {"type": "output_text", "text": text}
                 }),
             ));
+            if let Some(reasoning) = reasoning {
+                sse.push_str(&sse_event(
+                    "response.content_part.added",
+                    &json!({
+                        "type": "response.content_part.added",
+                        "response_id": response_id,
+                        "item_id": item_id,
+                        "output_index": index,
+                        "content_index": 1,
+                        "part": {"type": "reasoning", "reasoning": ""}
+                    }),
+                ));
+                sse.push_str(&sse_event(
+                    "response.content_part.done",
+                    &json!({
+                        "type": "response.content_part.done",
+                        "response_id": response_id,
+                        "item_id": item_id,
+                        "output_index": index,
+                        "content_index": 1,
+                        "part": {"type": "reasoning", "reasoning": reasoning}
+                    }),
+                ));
+            }
             sse.push_str(&sse_event(
                 "response.output_item.done",
                 &json!({
@@ -1156,6 +1315,69 @@ mod tests {
     }
 
     #[test]
+    fn maps_responses_reasoning_effort_to_anthropic_thinking() {
+        let request = responses_to_anthropic_request(
+            &json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+                "reasoning": {"effort": "high"}
+            }),
+            None,
+        );
+
+        assert_eq!(request["thinking"]["type"], "enabled");
+        assert_eq!(request["thinking"]["budget_tokens"], 16384);
+        assert_eq!(request["max_tokens"], 17408);
+        assert_eq!(request["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn maps_responses_xhigh_to_anthropic_max_effort() {
+        let request = responses_to_anthropic_request(
+            &json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+                "reasoning": {"effort": "xhigh"}
+            }),
+            None,
+        );
+
+        assert_eq!(request["thinking"]["budget_tokens"], 32000);
+        assert_eq!(request["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn reasoning_none_does_not_enable_anthropic_thinking() {
+        let request = responses_to_anthropic_request(
+            &json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+                "reasoning": {"effort": "none"}
+            }),
+            None,
+        );
+
+        assert!(request.get("thinking").is_none());
+        assert_eq!(request["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn preserves_anthropic_max_tokens_when_above_thinking_budget() {
+        let request = responses_to_anthropic_request(
+            &json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type": "message", "role": "user", "content": "hi"}],
+                "max_output_tokens": 20000,
+                "reasoning": {"effort": "high"}
+            }),
+            None,
+        );
+
+        assert_eq!(request["thinking"]["budget_tokens"], 16384);
+        assert_eq!(request["max_tokens"], 20000);
+    }
+
+    #[test]
     fn converts_responses_tool_items_to_anthropic_tool_blocks() {
         let request = responses_to_anthropic_request(
             &json!({
@@ -1191,6 +1413,45 @@ mod tests {
     }
 
     #[test]
+    fn replays_responses_reasoning_as_anthropic_thinking_before_assistant_text() {
+        let request = responses_to_anthropic_request(
+            &json!({
+                "model": "MiniMax-M2.7",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": "prior thinking"}],
+                        "encrypted_content": null
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "prior answer"}]
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next"}]
+                    }
+                ]
+            }),
+            None,
+        );
+
+        assert_eq!(request["messages"][0]["role"], "assistant");
+        assert_eq!(request["messages"][0]["content"][0]["type"], "thinking");
+        assert_eq!(
+            request["messages"][0]["content"][0]["thinking"],
+            "prior thinking"
+        );
+        assert_eq!(request["messages"][0]["content"][1]["type"], "text");
+        assert_eq!(request["messages"][0]["content"][1]["text"], "prior answer");
+        assert_eq!(request["messages"][1]["role"], "user");
+    }
+
+    #[test]
     fn converts_anthropic_tool_use_to_responses_sse() {
         let response = anthropic_to_responses_response(
             &json!({
@@ -1213,6 +1474,74 @@ mod tests {
     }
 
     #[test]
+    fn omits_reasoning_content_from_in_progress_function_call_sse_item() {
+        let response = openai_chat_to_responses_response(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "Need to inspect files.",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": "{\"cmd\":\"pwd\"}"}
+                        }]
+                    }
+                }]
+            }),
+            "mimo-test",
+        );
+
+        let sse = responses_response_to_sse(&response);
+        let added_start = sse.find("event: response.output_item.added").unwrap();
+        let done_start = sse.find("event: response.output_item.done").unwrap();
+        let added_slice = &sse[added_start..done_start];
+        assert!(!added_slice.contains("reasoning_content"));
+        assert!(sse.contains("Need to inspect files."));
+    }
+
+    #[test]
+    fn emits_reasoning_content_parts_in_message_sse() {
+        let response = openai_chat_to_responses_response(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Final answer.",
+                        "reasoning_content": "Private reasoning."
+                    }
+                }]
+            }),
+            "mimo-test",
+        );
+
+        let sse = responses_response_to_sse(&response);
+        assert!(sse.contains("Private reasoning."));
+    }
+
+    #[test]
+    fn converts_anthropic_thinking_to_responses_reasoning_item() {
+        let response = anthropic_to_responses_response(
+            &json!({
+                "content": [
+                    {"type": "thinking", "thinking": "Need to inspect files."},
+                    {"type": "text", "text": "Done."}
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }),
+            "MiniMax-M2.7",
+        );
+
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(
+            response["output"][0]["content"][1]["reasoning"],
+            "Need to inspect files."
+        );
+        assert_eq!(response["output"][0]["content"][0]["text"], "Done.");
+    }
+
+    #[test]
     fn converts_responses_request_to_openai_chat_and_back() {
         let request = responses_to_openai_chat_request(
             &json!({
@@ -1227,14 +1556,17 @@ mod tests {
                     "type": "function",
                     "name": "shell",
                     "parameters": {"type": "object"}
-                }]
+                }],
+                "reasoning": {"effort": "xhigh"}
             }),
             Some("actual-model"),
+            false,
         );
         assert_eq!(request["model"], "actual-model");
         assert_eq!(request["messages"][0]["role"], "system");
         assert_eq!(request["messages"][1]["content"], "hello");
         assert_eq!(request["tools"][0]["function"]["name"], "shell");
+        assert_eq!(request["reasoning_effort"], "high");
 
         let response = openai_chat_to_responses_response(
             &json!({
@@ -1259,11 +1591,138 @@ mod tests {
     }
 
     #[test]
+    fn replays_responses_reasoning_as_openai_chat_reasoning_content() {
+        let request = responses_to_openai_chat_request(
+            &json!({
+                "model": "mimo-test",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": "prior thinking"}],
+                        "encrypted_content": null
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "prior answer"}]
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next"}]
+                    }
+                ]
+            }),
+            None,
+            false,
+        );
+
+        assert_eq!(request["messages"][0]["role"], "assistant");
+        assert_eq!(
+            request["messages"][0]["reasoning_content"],
+            "prior thinking"
+        );
+        assert_eq!(request["messages"][0]["content"], "prior answer");
+        assert_eq!(request["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn fills_missing_reasoning_content_for_mimo_assistant_messages() {
+        let request = responses_to_openai_chat_request(
+            &json!({
+                "model": "mimo-test",
+                "input": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "prior answer"}]
+                }]
+            }),
+            None,
+            true,
+        );
+
+        assert_eq!(request["messages"][0]["reasoning_content"], "prior answer");
+    }
+
+    #[test]
+    fn fills_missing_reasoning_content_for_mimo_tool_calls() {
+        let request = responses_to_openai_chat_request(
+            &json!({
+                "model": "mimo-test",
+                "input": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell",
+                    "arguments": "{}"
+                }]
+            }),
+            None,
+            true,
+        );
+
+        assert_eq!(request["messages"][0]["reasoning_content"], " ");
+    }
+
+    #[test]
+    fn converts_openai_chat_reasoning_content_to_responses_message_reasoning_part() {
+        let response = openai_chat_to_responses_response(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "Need to inspect files.",
+                        "content": "Done."
+                    }
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+            }),
+            "mimo-test",
+        );
+
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(
+            response["output"][0]["content"][1]["reasoning"],
+            "Need to inspect files."
+        );
+        assert_eq!(response["output"][0]["content"][0]["text"], "Done.");
+    }
+
+    #[test]
+    fn copies_openai_chat_reasoning_content_to_function_call_item() {
+        let response = openai_chat_to_responses_response(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "Need to call a tool.",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": "{\"cmd\":\"pwd\"}"}
+                        }]
+                    }
+                }]
+            }),
+            "mimo-test",
+        );
+
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(
+            response["output"][0]["reasoning_content"],
+            "Need to call a tool."
+        );
+    }
+
+    #[test]
     fn builds_codex_models_response_metadata() {
         let model = RouterModelMetadata {
             id: "MiniMax-M2.7-highspeed".to_string(),
             name: "MiniMax-M2.7-highspeed".to_string(),
             context_window: Some(204_800),
+            supports_reasoning: true,
         };
         let info = codex_model_info(&model);
 
@@ -1273,5 +1732,28 @@ mod tests {
         assert_eq!(info["max_context_window"], 204_800);
         assert_eq!(info["shell_type"], "shell_command");
         assert_eq!(info["truncation_policy"]["mode"], "tokens");
+        assert_eq!(info["supports_reasoning_summaries"], true);
+        assert_eq!(info["default_reasoning_level"], "medium");
+        assert_eq!(info["supported_reasoning_levels"][3]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn builds_codex_models_response_without_reasoning_for_plain_models() {
+        let model = RouterModelMetadata {
+            id: "plain-model".to_string(),
+            name: "Plain Model".to_string(),
+            context_window: None,
+            supports_reasoning: false,
+        };
+        let info = codex_model_info(&model);
+
+        assert_eq!(info["supports_reasoning_summaries"], false);
+        assert_eq!(info["default_reasoning_level"], Value::Null);
+        assert!(
+            info["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
