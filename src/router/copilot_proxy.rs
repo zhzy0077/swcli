@@ -1,5 +1,5 @@
-use crate::github_copilot;
-use crate::responses_router;
+use crate::provider::github_copilot;
+use crate::router::responses;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ struct ProxyState {
     refresh_token: String,
     base_url: String,
     mode: ProxyMode,
-    model: Option<responses_router::RouterModelMetadata>,
+    model: Option<responses::RouterModelMetadata>,
     client: reqwest::Client,
 }
 
@@ -40,7 +40,7 @@ enum ProxyMode {
 pub async fn start_openai_responses_proxy(
     refresh_token: String,
     base_url: String,
-    model: Option<responses_router::RouterModelMetadata>,
+    model: Option<responses::RouterModelMetadata>,
 ) -> Result<ProxyHandle> {
     start_proxy(refresh_token, base_url, ProxyMode::OpenaiResponses, model).await
 }
@@ -63,7 +63,7 @@ async fn start_proxy(
     refresh_token: String,
     base_url: String,
     mode: ProxyMode,
-    model: Option<responses_router::RouterModelMetadata>,
+    model: Option<responses::RouterModelMetadata>,
 ) -> Result<ProxyHandle> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
@@ -135,7 +135,7 @@ async fn route_request(request: &HttpRequest, state: &ProxyState) -> Result<Prox
             }
             "/models" | "/v1/models" => Ok(ProxyResponse::Buffered(http_json(
                 200,
-                &responses_router::codex_models_response(state.model.as_ref()),
+                &responses::codex_models_response(state.model.as_ref()),
             ))),
             _ => Ok(ProxyResponse::Buffered(http_json(
                 404,

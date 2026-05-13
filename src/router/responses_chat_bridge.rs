@@ -20,7 +20,9 @@ pub fn convert_responses_to_openai_chat_request(
 
     if let Some(items) = body.get("input").and_then(|value| value.as_array()) {
         let mut pending_reasoning = Vec::new();
-        for item in items {
+        let mut index = 0;
+        while index < items.len() {
+            let item = &items[index];
             match item.get("type").and_then(|value| value.as_str()) {
                 Some("reasoning") => {
                     pending_reasoning.extend(responses_reasoning_item_texts(item));
@@ -46,35 +48,28 @@ pub fn convert_responses_to_openai_chat_request(
                     messages.push(message);
                 }
                 Some("function_call") => {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| item.get("id").and_then(|value| value.as_str()))
-                        .unwrap_or("call_0");
-                    let name = item
-                        .get("name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("{}");
+                    let mut tool_calls = Vec::new();
+                    while index < items.len()
+                        && items[index].get("type").and_then(|value| value.as_str())
+                            == Some("function_call")
+                    {
+                        let item = &items[index];
+                        pending_reasoning.extend(responses_item_reasoning_content(item));
+                        tool_calls.push(openai_chat_tool_call_from_responses_item(item));
+                        index += 1;
+                    }
                     let mut message = json!({
                         "role": "assistant",
                         "content": null,
-                        "tool_calls": [{
-                            "id": call_id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": arguments}
-                        }]
+                        "tool_calls": tool_calls
                     });
-                    pending_reasoning.extend(responses_item_reasoning_content(item));
                     attach_pending_reasoning_content(
                         &mut message,
                         &mut pending_reasoning,
                         requires_reasoning_content,
                     );
                     messages.push(message);
+                    continue;
                 }
                 Some("function_call_output") => {
                     let call_id = item
@@ -98,6 +93,7 @@ pub fn convert_responses_to_openai_chat_request(
                 }
                 _ => {}
             }
+            index += 1;
         }
         if !pending_reasoning.is_empty() {
             messages.push(json!({
@@ -139,6 +135,27 @@ pub fn convert_responses_to_openai_chat_request(
         req["reasoning_effort"] = json!(effort);
     }
     req
+}
+
+fn openai_chat_tool_call_from_responses_item(item: &Value) -> Value {
+    let call_id = item
+        .get("call_id")
+        .and_then(|value| value.as_str())
+        .or_else(|| item.get("id").and_then(|value| value.as_str()))
+        .unwrap_or("call_0");
+    let name = item
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let arguments = item
+        .get("arguments")
+        .and_then(|value| value.as_str())
+        .unwrap_or("{}");
+    json!({
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments}
+    })
 }
 
 pub fn convert_openai_chat_response_to_responses_sse(

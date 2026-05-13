@@ -66,7 +66,7 @@ pub(crate) struct KeysArgs {
     /// Provider base URL for add/edit.
     #[arg(long = "base-url")]
     pub(crate) base_url: Option<String>,
-    /// API key for add/edit. Stored locally obfuscated, not printed in lists.
+    /// API key for add/edit. Stored locally in config, not printed in lists.
     #[arg(long)]
     pub(crate) key: Option<String>,
     /// Provider kind: openai, anthropic, codex-oauth, claude-oauth.

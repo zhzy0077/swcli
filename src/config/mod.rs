@@ -1,16 +1,11 @@
 use crate::provider::{
     ProviderKind, WireProtocol, default_wire_for_provider, resolve_builtin_preset,
 };
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::PathBuf;
@@ -192,7 +187,7 @@ impl ApiKey {
         self.oauth_token
             .as_ref()
             .ok_or_else(|| anyhow!("Key `{}` has no OAuth token.", self.name))
-            .and_then(|s| decode_secret(s))
+            .cloned()
     }
 
     pub(crate) fn plain_secret(&self) -> Result<String> {
@@ -200,22 +195,8 @@ impl ApiKey {
             .as_ref()
             .or(self.oauth_token.as_ref())
             .ok_or_else(|| anyhow!("Key `{}` has no usable secret.", self.name))
-            .and_then(|s| decode_secret(s))
+            .cloned()
     }
-}
-
-pub(crate) fn encode_secret(secret: &str) -> String {
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let cipher = Aes256Gcm::new_from_slice(&local_secret_key()).expect("valid AES-256 key");
-    let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), secret.as_bytes())
-        .expect("encryption should succeed");
-    format!(
-        "enc:v1:{}:{}",
-        BASE64.encode(nonce_bytes),
-        BASE64.encode(ciphertext)
-    )
 }
 
 pub(crate) fn random_id() -> String {
@@ -269,30 +250,4 @@ async fn write_json<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
     let data = serde_json::to_string_pretty(value)?;
     tokio::fs::write(path, data).await?;
     Ok(())
-}
-
-pub(crate) fn decode_secret(secret: &str) -> Result<String> {
-    if let Some(rest) = secret.strip_prefix("enc:v1:") {
-        let (nonce, ciphertext) = rest
-            .split_once(':')
-            .ok_or_else(|| anyhow!("Invalid encrypted secret format"))?;
-        let nonce = BASE64.decode(nonce)?;
-        let ciphertext = BASE64.decode(ciphertext)?;
-        let cipher = Aes256Gcm::new_from_slice(&local_secret_key()).expect("valid AES-256 key");
-        let plaintext = cipher
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-            .map_err(|_| anyhow!("Failed to decrypt saved secret on this machine"))?;
-        return Ok(String::from_utf8(plaintext)?);
-    }
-    let encoded = secret.strip_prefix("b64:").unwrap_or(secret);
-    let bytes = BASE64.decode(encoded)?;
-    Ok(String::from_utf8(bytes)?)
-}
-
-fn local_secret_key() -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"switchcli-local-key-v1");
-    hasher.update(env::var("HOME").unwrap_or_default().as_bytes());
-    hasher.update(env::var("USER").unwrap_or_default().as_bytes());
-    hasher.finalize().into()
 }

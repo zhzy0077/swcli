@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod github_copilot;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ProviderKind {

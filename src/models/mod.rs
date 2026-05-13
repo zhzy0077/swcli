@@ -1,9 +1,9 @@
 use crate::cli::{LaunchArgs, ModelsArgs};
-use crate::github_copilot;
-use crate::provider::{ProviderKind, WireProtocol, default_wire_for_provider};
-use crate::store::{
+use crate::config::{
     ApiKey, CacheEntry, ModelsDevCache, ModelsDevModel, ModelsDevProvider, Store, now_secs,
 };
+use crate::provider::github_copilot;
+use crate::provider::{ProviderKind, WireProtocol, default_wire_for_provider};
 use crate::tui;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};

@@ -1,4 +1,4 @@
-use crate::responses_chat_bridge;
+use super::responses_chat_bridge;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -418,9 +418,46 @@ fn responses_input_to_anthropic_messages(input: Option<&Value>) -> Vec<Value> {
     };
     let mut messages = Vec::new();
     let mut pending_thinking = Vec::new();
-    for item in items {
+    let mut index = 0;
+    while index < items.len() {
+        let item = &items[index];
         if item.get("type").and_then(|value| value.as_str()) == Some("reasoning") {
             pending_thinking.extend(responses_reasoning_item_to_anthropic_blocks(item));
+            index += 1;
+            continue;
+        }
+        if item.get("type").and_then(|value| value.as_str()) == Some("function_call") {
+            let mut content = Vec::new();
+            while index < items.len()
+                && items[index].get("type").and_then(|value| value.as_str())
+                    == Some("function_call")
+            {
+                content.push(responses_function_call_to_anthropic_tool_use(&items[index]));
+                index += 1;
+            }
+            let mut content = Value::Array(content);
+            prepend_pending_thinking(&mut content, &mut pending_thinking);
+            messages.push(json!({
+                "role": "assistant",
+                "content": content
+            }));
+            continue;
+        }
+        if item.get("type").and_then(|value| value.as_str()) == Some("function_call_output") {
+            let mut content = Vec::new();
+            while index < items.len()
+                && items[index].get("type").and_then(|value| value.as_str())
+                    == Some("function_call_output")
+            {
+                content.push(responses_function_call_output_to_anthropic_tool_result(
+                    &items[index],
+                ));
+                index += 1;
+            }
+            messages.push(json!({
+                "role": "user",
+                "content": content
+            }));
             continue;
         }
         if let Some(message) =
@@ -428,6 +465,7 @@ fn responses_input_to_anthropic_messages(input: Option<&Value>) -> Vec<Value> {
         {
             messages.push(message);
         }
+        index += 1;
     }
     if !pending_thinking.is_empty() {
         messages.push(json!({
@@ -436,6 +474,45 @@ fn responses_input_to_anthropic_messages(input: Option<&Value>) -> Vec<Value> {
         }));
     }
     messages
+}
+
+fn responses_function_call_to_anthropic_tool_use(item: &Value) -> Value {
+    let call_id = item
+        .get("call_id")
+        .and_then(|value| value.as_str())
+        .or_else(|| item.get("id").and_then(|value| value.as_str()))
+        .unwrap_or("call_0");
+    let name = item
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let input = item
+        .get("arguments")
+        .and_then(|value| value.as_str())
+        .and_then(|args| serde_json::from_str::<Value>(args).ok())
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "type": "tool_use",
+        "id": call_id,
+        "name": name,
+        "input": input
+    })
+}
+
+fn responses_function_call_output_to_anthropic_tool_result(item: &Value) -> Value {
+    let call_id = item
+        .get("call_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("call_0");
+    let output = item
+        .get("output")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    json!({
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": output
+    })
 }
 
 fn responses_input_item_to_anthropic_message(
@@ -1410,6 +1487,102 @@ mod tests {
         assert_eq!(request["messages"][0]["content"][0]["input"]["cmd"], "pwd");
         assert_eq!(request["messages"][1]["content"][0]["type"], "tool_result");
         assert_eq!(request["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn groups_parallel_responses_tool_calls_for_anthropic_messages() {
+        let request = responses_to_anthropic_request(
+            &json!({
+                "model": "placeholder",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"git diff\"}"
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"git status --short\"}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "diff"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_2",
+                        "output": "status"
+                    }
+                ]
+            }),
+            Some("MiniMax-M2.7-highspeed"),
+        );
+
+        assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(request["messages"][0]["role"], "assistant");
+        assert_eq!(request["messages"][0]["content"][0]["type"], "tool_use");
+        assert_eq!(request["messages"][0]["content"][0]["id"], "call_1");
+        assert_eq!(request["messages"][0]["content"][1]["type"], "tool_use");
+        assert_eq!(request["messages"][0]["content"][1]["id"], "call_2");
+        assert_eq!(request["messages"][1]["role"], "user");
+        assert_eq!(request["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            request["messages"][1]["content"][0]["tool_use_id"],
+            "call_1"
+        );
+        assert_eq!(request["messages"][1]["content"][1]["type"], "tool_result");
+        assert_eq!(
+            request["messages"][1]["content"][1]["tool_use_id"],
+            "call_2"
+        );
+    }
+
+    #[test]
+    fn groups_parallel_responses_tool_calls_for_openai_chat() {
+        let request = responses_to_openai_chat_request(
+            &json!({
+                "model": "mimo-test",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"git diff\"}"
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"git status --short\"}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "diff"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_2",
+                        "output": "status"
+                    }
+                ]
+            }),
+            None,
+            false,
+        );
+
+        assert_eq!(request["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(request["messages"][0]["role"], "assistant");
+        assert_eq!(request["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(request["messages"][0]["tool_calls"][1]["id"], "call_2");
+        assert_eq!(request["messages"][1]["role"], "tool");
+        assert_eq!(request["messages"][1]["tool_call_id"], "call_1");
+        assert_eq!(request["messages"][2]["role"], "tool");
+        assert_eq!(request["messages"][2]["tool_call_id"], "call_2");
     }
 
     #[test]

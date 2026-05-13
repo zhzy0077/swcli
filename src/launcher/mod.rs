@@ -1,9 +1,8 @@
 use crate::cli::LaunchArgs;
-use crate::copilot_proxy;
+use crate::config::{ApiKey, Store, random_id};
 use crate::models;
 use crate::provider::WireProtocol;
-use crate::responses_router;
-use crate::store::{ApiKey, Store, random_id};
+use crate::router::{copilot_proxy, responses};
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::env;
@@ -25,7 +24,7 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
     validate_tool_provider(tool, &key, effective_wire)?;
     let router_model = resolved_model
         .as_ref()
-        .map(|model| responses_router::RouterModelMetadata {
+        .map(|model| responses::RouterModelMetadata {
             id: model.id.clone(),
             name: model.name.clone(),
             context_window: model.context_window,
@@ -89,7 +88,7 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
                         )
                         .await?;
                         let proxy_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
-                        let router = responses_router::start_openai_chat_responses_router(
+                        let router = responses::start_openai_chat_responses_router(
                             proxy_base_url,
                             "github-copilot".to_string(),
                             router_model.clone(),
@@ -105,7 +104,7 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
                         )
                         .await?;
                         let proxy_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
-                        let router = responses_router::start_anthropic_responses_router(
+                        let router = responses::start_anthropic_responses_router(
                             proxy_base_url,
                             "github-copilot".to_string(),
                             router_model.clone(),
@@ -139,7 +138,7 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
             let api_key = key.plain_secret()?;
             let router = match effective_wire {
                 WireProtocol::AnthropicMessages => {
-                    responses_router::start_anthropic_responses_router(
+                    responses::start_anthropic_responses_router(
                         key.base_url.clone(),
                         api_key,
                         router_model.clone(),
@@ -147,7 +146,7 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
                     .await?
                 }
                 WireProtocol::OpenaiCompletions => {
-                    responses_router::start_openai_chat_responses_router(
+                    responses::start_openai_chat_responses_router(
                         key.base_url.clone(),
                         api_key,
                         router_model.clone(),
@@ -377,14 +376,14 @@ impl Drop for TempCodexModelCatalog {
 }
 
 async fn write_codex_model_catalog(
-    model: Option<&responses_router::RouterModelMetadata>,
+    model: Option<&responses::RouterModelMetadata>,
 ) -> Result<TempCodexModelCatalog> {
     let path = env::temp_dir().join(format!(
         "swcli-codex-model-catalog-{}-{}.json",
         std::process::id(),
         random_id()
     ));
-    let body = serde_json::to_vec_pretty(&responses_router::codex_models_response(model))?;
+    let body = serde_json::to_vec_pretty(&responses::codex_models_response(model))?;
     tokio::fs::write(&path, body).await?;
     Ok(TempCodexModelCatalog { path })
 }

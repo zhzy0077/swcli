@@ -7,22 +7,20 @@ use serde_json::{Value, json};
 use std::io::{self, IsTerminal};
 
 mod cli;
-mod copilot_proxy;
-mod github_copilot;
-mod launch;
+mod config;
+mod launcher;
 mod models;
 mod provider;
-mod responses_chat_bridge;
-mod responses_router;
-mod store;
+mod router;
 mod tui;
 
 use cli::{KeysArgs, ParsedCommand, normalize_cli, parse_cli};
+use config::{ApiKey, Store, random_id};
+use provider::github_copilot;
 use provider::{
     BUILTIN_PRESETS, BuiltinPreset, ProviderKind, default_base_url, default_wire_for_provider,
     resolve_builtin_preset,
 };
-use store::{ApiKey, Store, decode_secret, encode_secret, random_id};
 
 #[cfg(test)]
 use provider::WireProtocol;
@@ -40,7 +38,7 @@ async fn main() -> Result<()> {
     store.ensure_key_wires().await?;
 
     match normalize_cli(cli)? {
-        ParsedCommand::Launch(args) => launch::run_tool(&mut store, args).await,
+        ParsedCommand::Launch(args) => launcher::run_tool(&mut store, args).await,
         ParsedCommand::Keys(args) => handle_keys(&mut store, args).await,
         ParsedCommand::Models(args) => models::handle_models(&mut store, args).await,
     }
@@ -108,8 +106,8 @@ async fn add_key(store: &mut Store, args: KeysArgs) -> Result<()> {
         .take()
         .or_else(|| preset.map(|p| p.endpoint.to_string()))
         .unwrap_or_else(|| default_base_url(provider).to_string());
-    let secret = add.key.take().map(|s| encode_secret(&s));
-    let mut oauth_token = add.oauth_token.take().map(|s| encode_secret(&s));
+    let secret = add.key.take();
+    let mut oauth_token = add.oauth_token.take();
     if preset.map(|p| p.alias) == Some("github-copilot") && oauth_token.is_none() {
         if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
             bail!(
@@ -117,18 +115,14 @@ async fn add_key(store: &mut Store, args: KeysArgs) -> Result<()> {
             );
         }
         let token = github_copilot::device_flow_login().await?;
-        oauth_token = Some(encode_secret(&token));
+        oauth_token = Some(token);
     }
     if secret.is_none() && oauth_token.is_none() {
         bail!(
             "Missing credential. Pass --key/--oauth-token or run `swcli keys add` interactively."
         );
     }
-    let token = secret
-        .as_ref()
-        .or(oauth_token.as_ref())
-        .map(|s| decode_secret(s))
-        .transpose()?;
+    let token = secret.as_ref().or(oauth_token.as_ref()).cloned();
     let wire = match add.wire {
         Some(wire) => wire,
         None if let Some(preset) = preset => preset.wire,
@@ -340,10 +334,10 @@ async fn edit_key(store: &mut Store, args: KeysArgs) -> Result<()> {
         key.base_url = base_url;
     }
     if let Some(secret) = args.key {
-        key.secret = Some(encode_secret(&secret));
+        key.secret = Some(secret);
     }
     if let Some(token) = args.oauth_token {
-        key.oauth_token = Some(encode_secret(&token));
+        key.oauth_token = Some(token);
     }
     if let Some(provider) = args.provider {
         key.provider = provider;
@@ -547,11 +541,11 @@ mod tests {
     #[test]
     fn appends_claude_context_suffix_once() {
         assert_eq!(
-            launch::maybe_context_model("claude-sonnet-4-5", Some("1m")),
+            launcher::maybe_context_model("claude-sonnet-4-5", Some("1m")),
             "claude-sonnet-4-5[1m]"
         );
         assert_eq!(
-            launch::maybe_context_model("claude-sonnet-4-5[1m]", Some("2m")),
+            launcher::maybe_context_model("claude-sonnet-4-5[1m]", Some("2m")),
             "claude-sonnet-4-5[1m]"
         );
     }
@@ -564,7 +558,7 @@ mod tests {
             base_url: "https://api.example.com/v1".to_string(),
             provider: ProviderKind::Openai,
             wire: Some(WireProtocol::OpenaiResponses),
-            secret: Some(encode_secret("sk-test")),
+            secret: Some("sk-test".to_string()),
             oauth_token: None,
             preset_alias: None,
             models_dev_provider_name: None,
@@ -704,38 +698,38 @@ mod tests {
 
     #[test]
     fn validates_native_tool_provider_protocols() {
-        assert!(launch::tool_supports_wire(
-            launch::Tool::Codex,
+        assert!(launcher::tool_supports_wire(
+            launcher::Tool::Codex,
             WireProtocol::OpenaiResponses
         ));
-        assert!(launch::tool_supports_wire(
-            launch::Tool::Codex,
+        assert!(launcher::tool_supports_wire(
+            launcher::Tool::Codex,
             WireProtocol::OpenaiCompletions
         ));
-        assert!(launch::tool_supports_wire(
-            launch::Tool::Codex,
+        assert!(launcher::tool_supports_wire(
+            launcher::Tool::Codex,
             WireProtocol::AnthropicMessages
         ));
-        assert!(!launch::wire_needs_codex_router(
+        assert!(!launcher::wire_needs_codex_router(
             WireProtocol::OpenaiResponses
         ));
-        assert!(launch::wire_needs_codex_router(
+        assert!(launcher::wire_needs_codex_router(
             WireProtocol::OpenaiCompletions
         ));
-        assert!(launch::wire_needs_codex_router(
+        assert!(launcher::wire_needs_codex_router(
             WireProtocol::AnthropicMessages
         ));
 
-        assert!(launch::tool_supports_wire(
-            launch::Tool::Claude,
+        assert!(launcher::tool_supports_wire(
+            launcher::Tool::Claude,
             WireProtocol::AnthropicMessages
         ));
-        assert!(!launch::tool_supports_wire(
-            launch::Tool::Claude,
+        assert!(!launcher::tool_supports_wire(
+            launcher::Tool::Claude,
             WireProtocol::OpenaiResponses
         ));
-        assert!(!launch::tool_supports_wire(
-            launch::Tool::Claude,
+        assert!(!launcher::tool_supports_wire(
+            launcher::Tool::Claude,
             WireProtocol::OpenaiCompletions
         ));
     }
