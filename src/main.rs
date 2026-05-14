@@ -8,8 +8,11 @@ use std::io::{self, IsTerminal};
 
 mod cli;
 mod config;
+mod db;
 mod launcher;
 mod models;
+#[path = "nyro_protocol/mod.rs"]
+mod protocol;
 mod provider;
 mod router;
 mod tui;
