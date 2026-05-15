@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! OpenAI Responses API egress encoder (PR-09).
 //!
 //! PR-09 adds forwarding for:

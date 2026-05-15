@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! OpenAI Embeddings API (`POST /v1/embeddings`).
 //!
 //! Embeddings is a passthrough endpoint — the gateway forwards the

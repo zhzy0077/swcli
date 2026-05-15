@@ -348,19 +348,19 @@ fn inject_codex_provider_config(
     }
     if let Some(api_key) = envs.remove("OPENAI_API_KEY") {
         envs.remove("OPENAI_BASE_URL");
-        envs.insert("AIVO_CODEX_API_KEY".to_string(), api_key);
+        envs.insert("SWCLI_CODEX_API_KEY".to_string(), api_key);
         args.extend([
             "--config".to_string(),
-            "model_provider=\"aivo\"".to_string(),
+            "model_provider=\"swcli\"".to_string(),
             "--config".to_string(),
-            "model_providers.aivo.name=\"aivo\"".to_string(),
+            "model_providers.swcli.name=\"swcli\"".to_string(),
             "--config".to_string(),
             format!(
-                "model_providers.aivo.base_url=\"{}\"",
+                "model_providers.swcli.base_url=\"{}\"",
                 base_url.replace('"', "\\\"")
             ),
             "--config".to_string(),
-            "model_providers.aivo.env_key=\"AIVO_CODEX_API_KEY\"".to_string(),
+            "model_providers.swcli.env_key=\"SWCLI_CODEX_API_KEY\"".to_string(),
         ]);
     }
 }

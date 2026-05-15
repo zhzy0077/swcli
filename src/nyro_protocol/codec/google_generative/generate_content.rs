@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! Google Generative AI (`POST /v1beta/models/:model:generateContent`).
 //!
 //! Wire version `v1beta` matches Google's URL versioning.

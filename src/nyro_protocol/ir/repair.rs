@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! Single-direction IR repair passes.
 //!
 //! Each function mutates an `AiRequest` to fix common structural issues found

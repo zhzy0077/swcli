@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! Wire-format types for the OpenAI Chat Completions API.
 //!
 //! PR-08 adds the full field set:

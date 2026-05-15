@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! Compatibility shims between the old `InternalRequest`/`InternalResponse` and
 //! the new `AiRequest`/`AiResponse`.
 //!

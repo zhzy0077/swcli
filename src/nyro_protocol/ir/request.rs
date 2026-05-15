@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! `AiRequest` — the new unified ingress IR for all supported protocols.
 //!
 //! PR-08–12 will update the codec decoders to produce `AiRequest` instead of

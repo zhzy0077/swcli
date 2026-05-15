@@ -222,13 +222,13 @@ fn infer_key_wire(key: &ApiKey) -> WireProtocol {
 }
 
 fn config_dir() -> Result<PathBuf> {
-    if let Ok(dir) = env::var("AIVO_CONFIG_DIR") {
+    if let Ok(dir) = env::var("SWCLI_CONFIG_DIR") {
         return Ok(PathBuf::from(dir));
     }
     if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(dir).join("switchcli"));
     }
-    let home = env::var("HOME").context("HOME is not set; set AIVO_CONFIG_DIR explicitly")?;
+    let home = env::var("HOME").context("HOME is not set; set SWCLI_CONFIG_DIR explicitly")?;
     Ok(PathBuf::from(home).join(".config").join("switchcli"))
 }
 

@@ -1,4 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 //! Protocol layer.
+//!
+//! Portions adapted from Nyro <https://github.com/nyroway/nyro>,
+//! licensed under the Apache License 2.0. See `THIRD_PARTY_NOTICES.md`
+//! and `LICENSES/Apache-2.0.txt`.
 #![allow(dead_code, unused_imports)]
 //!
 //! # Three-layer identity

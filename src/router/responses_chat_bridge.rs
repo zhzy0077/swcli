@@ -1,11 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Nyro: https://github.com/nyroway/nyro
+// Local modifications for swcli.
+
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Ported from `../aivo`'s Responses↔Chat bridge, with the local
-/// Responses `reasoning` item replay and Codex snapshot compatibility kept.
+/// Adapted from Nyro's Responses↔Chat bridge (<https://github.com/nyroway/nyro>),
+/// licensed under the Apache License 2.0; see `THIRD_PARTY_NOTICES.md`.
+/// Local changes keep Responses `reasoning` item replay and Codex snapshot
+/// compatibility.
 pub fn convert_responses_to_openai_chat_request(
     body: &Value,
     actual_model: Option<&str>,
