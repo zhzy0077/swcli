@@ -226,10 +226,10 @@ fn config_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(dir).join("switchcli"));
+        return Ok(PathBuf::from(dir).join("swcli"));
     }
     let home = env::var("HOME").context("HOME is not set; set SWCLI_CONFIG_DIR explicitly")?;
-    Ok(PathBuf::from(home).join(".config").join("switchcli"))
+    Ok(PathBuf::from(home).join(".config").join("swcli"))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Result<Option<T>> {
