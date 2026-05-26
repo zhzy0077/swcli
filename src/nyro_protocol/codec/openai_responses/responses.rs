@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 //! OpenAI Responses API (`POST /v1/responses`).
 //!
 //! `force_upstream_stream` is true: the upstream call is always made in
@@ -31,22 +27,22 @@ impl EndpointHandler for OpenAIResponsesV1 {
     fn capabilities(&self) -> &'static EndpointCapabilities {
         &CAPS
     }
-    fn make_decoder(&self) -> Box<dyn IngressDecoder + Send> {
+    fn make_request_decoder(&self) -> Box<dyn RequestDecoder + Send> {
         Box::new(super::decoder::ResponsesDecoder)
     }
-    fn make_encoder(&self) -> Box<dyn EgressEncoder + Send> {
+    fn make_request_encoder(&self) -> Box<dyn RequestEncoder + Send> {
         Box::new(super::encoder::ResponsesEncoder)
     }
-    fn make_response_parser(&self) -> Box<dyn ResponseParser> {
+    fn make_response_decoder(&self) -> Box<dyn ResponseDecoder> {
         Box::new(super::parser::ResponsesResponseParser)
     }
-    fn make_response_formatter(&self) -> Box<dyn ResponseFormatter> {
+    fn make_response_encoder(&self) -> Box<dyn ResponseEncoder> {
         Box::new(super::formatter::ResponsesResponseFormatter)
     }
-    fn make_stream_parser(&self) -> Box<dyn StreamParser> {
+    fn make_stream_response_decoder(&self) -> Box<dyn StreamResponseDecoder> {
         Box::new(super::parser::ResponsesStreamParser::new())
     }
-    fn make_stream_formatter(&self) -> Box<dyn StreamFormatter> {
+    fn make_stream_response_encoder(&self) -> Box<dyn StreamResponseEncoder> {
         Box::new(super::stream::ResponsesStreamFormatter::new())
     }
 }

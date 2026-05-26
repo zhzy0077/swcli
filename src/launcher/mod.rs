@@ -2,7 +2,7 @@ use crate::cli::LaunchArgs;
 use crate::config::{ApiKey, Store, random_id};
 use crate::models;
 use crate::provider::WireProtocol;
-use crate::router::{copilot_proxy, responses};
+use crate::router::responses;
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::env;
@@ -63,7 +63,6 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
             }
         }
     }
-    let mut _copilot_proxy = None;
     let _router = if is_github_copilot_key(&key) {
         if args.dry_run {
             launch_base_url = "http://127.0.0.1:<swcli-github-copilot-router>/v1".to_string();
@@ -71,66 +70,26 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
         } else {
             let refresh_token = key.plain_oauth_token()?;
             let router = match tool {
-                Tool::Codex => match effective_wire {
-                    WireProtocol::OpenaiResponses => {
-                        let proxy = copilot_proxy::start_openai_responses_proxy(
-                            refresh_token.clone(),
-                            key.base_url.clone(),
-                            router_model.clone(),
-                        )
-                        .await?;
-                        launch_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
-                        _copilot_proxy = Some(proxy);
-                        None
-                    }
-                    WireProtocol::OpenaiCompletions => {
-                        let proxy = copilot_proxy::start_openai_chat_proxy(
-                            refresh_token.clone(),
-                            key.base_url.clone(),
-                        )
-                        .await?;
-                        let proxy_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
-                        let router = responses::start_openai_chat_responses_router(
-                            proxy_base_url,
-                            "github-copilot".to_string(),
-                            router_model.clone(),
-                        )
-                        .await?;
-                        _copilot_proxy = Some(proxy);
-                        Some(router)
-                    }
-                    WireProtocol::AnthropicMessages => {
-                        let proxy = copilot_proxy::start_anthropic_messages_proxy(
-                            refresh_token.clone(),
-                            key.base_url.clone(),
-                        )
-                        .await?;
-                        let proxy_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
-                        let router = responses::start_anthropic_responses_router(
-                            proxy_base_url,
-                            "github-copilot".to_string(),
-                            router_model.clone(),
-                        )
-                        .await?;
-                        _copilot_proxy = Some(proxy);
-                        Some(router)
-                    }
-                },
-                Tool::Claude => {
-                    let proxy = copilot_proxy::start_anthropic_messages_proxy(
-                        refresh_token,
+                Tool::Codex => {
+                    responses::start_github_copilot_codex_router(
                         key.base_url.clone(),
+                        refresh_token,
+                        effective_wire,
+                        router_model.clone(),
                     )
-                    .await?;
-                    launch_base_url = format!("http://127.0.0.1:{}/v1", proxy.port);
-                    _copilot_proxy = Some(proxy);
-                    None
+                    .await?
+                }
+                Tool::Claude => {
+                    responses::start_github_copilot_anthropic_messages_router(
+                        key.base_url.clone(),
+                        refresh_token,
+                        router_model.clone(),
+                    )
+                    .await?
                 }
             };
-            if let Some(ref router) = router {
-                launch_base_url = format!("http://127.0.0.1:{}/v1", router.port);
-            }
-            router
+            launch_base_url = format!("http://127.0.0.1:{}/v1", router.port);
+            Some(router)
         }
     } else if tool == Tool::Codex && wire_needs_codex_router(effective_wire) {
         if args.dry_run {

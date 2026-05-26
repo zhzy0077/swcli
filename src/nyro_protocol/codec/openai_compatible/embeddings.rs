@@ -1,12 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 //! OpenAI Embeddings API (`POST /v1/embeddings`).
 //!
 //! Embeddings is a passthrough endpoint — the gateway forwards the
 //! request body verbatim and only inspects `usage.prompt_tokens` from
-//! the response. We still register a `ProtocolHandler` so that:
+//! the response. We still register a `EndpointHandler` so that:
 //!
 //! 1. `ProtocolRegistry::find_by_ingress_route` resolves
 //!    `POST /v1/embeddings` (and `/embeddings`) to a known
@@ -36,10 +32,13 @@ use reqwest::header::HeaderMap;
 use serde_json::Value;
 
 use crate::protocol::SseEvent;
-use crate::protocol::ids::{EndpointCapabilities, OPENAI_EMBEDDINGS_V1, ProtocolEndpoint};
+use crate::protocol::ids::{
+    EndpointCapabilities, OPENAI_COMPATIBLE_EMBEDDINGS_V1, ProtocolEndpoint,
+};
+use crate::protocol::ir::Usage;
+use crate::protocol::ir::{AiRequest, GenerationConfig, Message, StreamConfig};
 use crate::protocol::registry::EndpointRegistration;
 use crate::protocol::traits::*;
-use crate::protocol::types::{InternalRequest, InternalResponse, StreamDelta, TokenUsage};
 
 /// Key under which the complete original request body is kept as a
 /// fallback (used by `embeddings_proxy` in handler.rs).
@@ -72,27 +71,27 @@ pub struct OpenAIEmbeddingsV1;
 
 impl EndpointHandler for OpenAIEmbeddingsV1 {
     fn id(&self) -> ProtocolEndpoint {
-        OPENAI_EMBEDDINGS_V1
+        OPENAI_COMPATIBLE_EMBEDDINGS_V1
     }
     fn capabilities(&self) -> &'static EndpointCapabilities {
         &CAPS
     }
-    fn make_decoder(&self) -> Box<dyn IngressDecoder + Send> {
+    fn make_request_decoder(&self) -> Box<dyn RequestDecoder + Send> {
         Box::new(EmbeddingsDecoder)
     }
-    fn make_encoder(&self) -> Box<dyn EgressEncoder + Send> {
+    fn make_request_encoder(&self) -> Box<dyn RequestEncoder + Send> {
         Box::new(EmbeddingsEncoder)
     }
-    fn make_response_parser(&self) -> Box<dyn ResponseParser> {
+    fn make_response_decoder(&self) -> Box<dyn ResponseDecoder> {
         Box::new(EmbeddingsResponseParser)
     }
-    fn make_response_formatter(&self) -> Box<dyn ResponseFormatter> {
+    fn make_response_encoder(&self) -> Box<dyn ResponseEncoder> {
         Box::new(EmbeddingsResponseFormatter)
     }
-    fn make_stream_parser(&self) -> Box<dyn StreamParser> {
+    fn make_stream_response_decoder(&self) -> Box<dyn StreamResponseDecoder> {
         Box::new(EmbeddingsStreamParser)
     }
-    fn make_stream_formatter(&self) -> Box<dyn StreamFormatter> {
+    fn make_stream_response_encoder(&self) -> Box<dyn StreamResponseEncoder> {
         Box::new(EmbeddingsStreamFormatter)
     }
 }
@@ -105,8 +104,8 @@ inventory::submit! {
 
 struct EmbeddingsDecoder;
 
-impl IngressDecoder for EmbeddingsDecoder {
-    fn decode_request(&self, body: Value) -> anyhow::Result<InternalRequest> {
+impl RequestDecoder for EmbeddingsDecoder {
+    fn decode_request(&self, body: Value) -> anyhow::Result<AiRequest> {
         let obj = body
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("embeddings request must be a JSON object"))?;
@@ -119,30 +118,26 @@ impl IngressDecoder for EmbeddingsDecoder {
             .map(ToString::to_string)
             .ok_or_else(|| anyhow::anyhow!("model is required for embeddings"))?;
 
-        let mut extra: HashMap<String, Value> = HashMap::new();
+        // ── Vendor ingress bag (backward compat for EmbeddingsEncoder) ─────────
+        let mut ingress: HashMap<String, Value> = HashMap::new();
 
         // Keep the original body so `embeddings_proxy` can forward it.
-        extra.insert(EMBEDDINGS_BODY_KEY.to_string(), body.clone());
+        ingress.insert(EMBEDDINGS_BODY_KEY.to_string(), body.clone());
 
-        // ── Parse known fields ────────────────────────────────────────────────
-        // `input` can be: string | string[] | integer[] | integer[][]
         if let Some(input) = obj.get("input") {
-            extra.insert("__emb_input".into(), input.clone());
+            ingress.insert("__emb_input".into(), input.clone());
         }
         if let Some(dims) = obj.get("dimensions") {
-            extra.insert("__emb_dimensions".into(), dims.clone());
+            ingress.insert("__emb_dimensions".into(), dims.clone());
         }
         if let Some(ef) = obj.get("encoding_format") {
-            extra.insert("__emb_encoding_format".into(), ef.clone());
+            ingress.insert("__emb_encoding_format".into(), ef.clone());
         }
         if let Some(user) = obj.get("user") {
-            extra.insert("__emb_user".into(), user.clone());
+            ingress.insert("__emb_user".into(), user.clone());
         }
 
-        // ── Vendor extensions – ingress segment ───────────────────────────────
         // Collect unknown fields into __vendor_ingress.
-        // Policy is VendorFieldPolicy::Drop, so the encoder will not forward
-        // them unless the policy is relaxed per-provider in the future.
         let mut vendor_ingress = serde_json::Map::new();
         for (k, v) in obj {
             if !KNOWN_EMBEDDINGS_FIELDS.contains(&k.as_str()) {
@@ -150,21 +145,19 @@ impl IngressDecoder for EmbeddingsDecoder {
             }
         }
         if !vendor_ingress.is_empty() {
-            extra.insert("__vendor_ingress".into(), Value::Object(vendor_ingress));
+            ingress.insert("__vendor_ingress".into(), Value::Object(vendor_ingress));
         }
 
-        Ok(InternalRequest {
-            messages: Vec::new(),
-            model,
-            stream: false,
-            temperature: None,
-            max_tokens: None,
-            top_p: None,
-            tools: None,
-            tool_choice: None,
-            source_protocol: OPENAI_EMBEDDINGS_V1,
-            extra,
-        })
+        let mut ai_req = AiRequest::new(model, Vec::<Message>::new());
+        ai_req.generation = GenerationConfig::default();
+        ai_req.stream = StreamConfig {
+            enabled: false,
+            include_usage: false,
+        };
+        ai_req.meta.source_protocol = Some(OPENAI_COMPATIBLE_EMBEDDINGS_V1);
+        ai_req.meta.vendor.ingress = ingress;
+
+        Ok(ai_req)
     }
 }
 
@@ -172,42 +165,30 @@ impl IngressDecoder for EmbeddingsDecoder {
 
 struct EmbeddingsEncoder;
 
-impl EgressEncoder for EmbeddingsEncoder {
-    fn encode_request(&self, req: &InternalRequest) -> anyhow::Result<(Value, HeaderMap)> {
-        // Build the egress body from explicit parsed fields.
-        // Override `model` because routing may have changed it.
+impl RequestEncoder for EmbeddingsEncoder {
+    fn encode_request(&self, req: &AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+        let ingress = &req.meta.vendor.ingress;
         let mut obj = serde_json::Map::new();
 
         obj.insert("model".into(), Value::String(req.model.clone()));
 
-        if let Some(input) = req.extra.get("__emb_input") {
+        if let Some(input) = ingress.get("__emb_input") {
             obj.insert("input".into(), input.clone());
-        } else if let Some(pb) = req.extra.get(EMBEDDINGS_BODY_KEY) {
-            // Fallback: take input from the original passthrough body.
+        } else if let Some(pb) = ingress.get(EMBEDDINGS_BODY_KEY) {
             if let Some(inp) = pb.get("input") {
                 obj.insert("input".into(), inp.clone());
             }
         }
 
-        if let Some(dims) = req.extra.get("__emb_dimensions") {
+        if let Some(dims) = ingress.get("__emb_dimensions") {
             obj.insert("dimensions".into(), dims.clone());
         }
-        if let Some(ef) = req.extra.get("__emb_encoding_format") {
+        if let Some(ef) = ingress.get("__emb_encoding_format") {
             obj.insert("encoding_format".into(), ef.clone());
         }
-        if let Some(user) = req.extra.get("__emb_user") {
+        if let Some(user) = ingress.get("__emb_user") {
             obj.insert("user".into(), user.clone());
         }
-
-        // ── Vendor extensions – egress segment ───────────────────────────────
-        // CAPS.unknown_field_policy = Drop; vendor fields are suppressed.
-        // If a future per-provider override sets Passthrough, emit them here:
-        //
-        //   if policy == VendorFieldPolicy::Passthrough {
-        //       if let Some(Value::Object(vi)) = req.extra.get("__vendor_ingress") {
-        //           for (k, v) in vi { obj.insert(k.clone(), v.clone()); }
-        //       }
-        //   }
 
         Ok((Value::Object(obj), HeaderMap::new()))
     }
@@ -219,8 +200,8 @@ impl EgressEncoder for EmbeddingsEncoder {
 
 struct EmbeddingsResponseParser;
 
-impl ResponseParser for EmbeddingsResponseParser {
-    fn parse_response(&self, _resp: Value) -> anyhow::Result<InternalResponse> {
+impl ResponseDecoder for EmbeddingsResponseParser {
+    fn parse_response(&self, _resp: Value) -> anyhow::Result<crate::protocol::ir::AiResponse> {
         unreachable!(
             "embeddings_proxy bypasses the codec pipeline; \
              revisit codec/openai/embeddings.rs before routing through it"
@@ -230,8 +211,8 @@ impl ResponseParser for EmbeddingsResponseParser {
 
 struct EmbeddingsResponseFormatter;
 
-impl ResponseFormatter for EmbeddingsResponseFormatter {
-    fn format_response(&self, _resp: &InternalResponse) -> Value {
+impl ResponseEncoder for EmbeddingsResponseFormatter {
+    fn format_response(&self, _resp: &crate::protocol::ir::AiResponse) -> Value {
         unreachable!(
             "embeddings_proxy bypasses the codec pipeline; \
              revisit codec/openai/embeddings.rs before routing through it"
@@ -241,41 +222,43 @@ impl ResponseFormatter for EmbeddingsResponseFormatter {
 
 struct EmbeddingsStreamParser;
 
-impl StreamParser for EmbeddingsStreamParser {
-    fn parse_chunk(&mut self, _raw: &str) -> anyhow::Result<Vec<StreamDelta>> {
+impl StreamResponseDecoder for EmbeddingsStreamParser {
+    fn parse_chunk(
+        &mut self,
+        _raw: &str,
+    ) -> anyhow::Result<Vec<crate::protocol::ir::AiStreamDelta>> {
         unreachable!("embeddings has streaming=false; check capabilities before calling")
     }
-    fn finish(&mut self) -> anyhow::Result<Vec<StreamDelta>> {
+    fn finish(&mut self) -> anyhow::Result<Vec<crate::protocol::ir::AiStreamDelta>> {
         unreachable!("embeddings has streaming=false; check capabilities before calling")
     }
 }
 
 struct EmbeddingsStreamFormatter;
 
-impl StreamFormatter for EmbeddingsStreamFormatter {
-    fn format_deltas(&mut self, _deltas: &[StreamDelta]) -> Vec<SseEvent> {
+impl StreamResponseEncoder for EmbeddingsStreamFormatter {
+    fn format_deltas(&mut self, _deltas: &[crate::protocol::ir::AiStreamDelta]) -> Vec<SseEvent> {
         unreachable!("embeddings has streaming=false; check capabilities before calling")
     }
     fn format_done(&mut self) -> Vec<SseEvent> {
         unreachable!("embeddings has streaming=false; check capabilities before calling")
     }
-    fn usage(&self) -> TokenUsage {
-        TokenUsage::default()
+    fn usage(&self) -> Usage {
+        Usage::default()
     }
 }
 
 /// Pull `usage.prompt_tokens` out of an OpenAI embeddings response.
 /// Shared with `proxy::handler::embeddings_proxy` so the passthrough
 /// path and any future codec route agree on accounting.
-pub fn parse_usage(payload: &Value) -> TokenUsage {
+pub fn parse_usage(payload: &Value) -> Usage {
     let prompt = payload
         .get("usage")
         .and_then(|u| u.get("prompt_tokens"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    TokenUsage {
-        input_tokens: prompt.max(0) as u32,
-        output_tokens: 0,
-        ..TokenUsage::default()
+    Usage {
+        prompt_tokens: prompt.max(0) as u32,
+        ..Usage::default()
     }
 }

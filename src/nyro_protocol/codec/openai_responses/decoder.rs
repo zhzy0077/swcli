@@ -1,31 +1,20 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
-//! OpenAI Responses API ingress decoder (PR-09).
-//!
-//! Added in PR-09:
-//! - `background` (bool) — run in background
-//! - `previous_response_id` — link to prior response (multi-turn stateful)
-//! - Built-in tools: `web_search_preview`, `file_search`, `computer_use_preview`
-//! - `store` — whether to store in conversation history
-//! - `include` — list of fields to include in the response
-//! - `truncation` — input truncation strategy
-//! - `metadata` / `text` / `temperature` / `top_p` (pre-existing, now explicit)
-//! - Full reasoning item handling (passed through as extra, skip silently)
+//! OpenAI Responses API ingress decoder — produces `AiRequest` directly.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::protocol::IngressDecoder;
+use crate::protocol::RequestDecoder;
 use crate::protocol::ids::OPENAI_RESPONSES_V1;
-use crate::protocol::types::*;
+use crate::protocol::ir::{
+    AiRequest, GenerationConfig, Message, MessageContent, OpenAIResponsesExt, ProtocolExt,
+    ReasoningConfig, Role, StreamConfig, ToolCall, ToolChoice, ToolSpec,
+};
 
 pub struct ResponsesDecoder;
 
-// Fields decoded into named IR fields (not extra).
+// Fields decoded into named IR fields (not ingress bag).
 const KNOWN_FIELDS: &[&str] = &[
     "model",
     "input",
@@ -36,7 +25,6 @@ const KNOWN_FIELDS: &[&str] = &[
     "top_p",
     "tools",
     "tool_choice",
-    // PR-09
     "background",
     "previous_response_id",
     "store",
@@ -50,8 +38,8 @@ const KNOWN_FIELDS: &[&str] = &[
     "user",
 ];
 
-impl IngressDecoder for ResponsesDecoder {
-    fn decode_request(&self, body: Value) -> Result<InternalRequest> {
+impl RequestDecoder for ResponsesDecoder {
+    fn decode_request(&self, body: Value) -> Result<AiRequest> {
         let obj = body
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("request body must be a JSON object"))?;
@@ -69,54 +57,55 @@ impl IngressDecoder for ResponsesDecoder {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
         let top_p = obj.get("top_p").and_then(|v| v.as_f64());
+        let parallel_tool_calls = obj.get("parallel_tool_calls").and_then(|v| v.as_bool());
 
-        let mut messages = Vec::new();
-        let tools = parse_tools(obj.get("tools"))?;
-        let tool_choice = obj.get("tool_choice").cloned();
+        // ── System (instructions) ─────────────────────────────────────────────
+        let mut messages: Vec<Message> = Vec::new();
 
         if let Some(inst) = obj.get("instructions").and_then(|v| v.as_str())
             && !inst.is_empty()
         {
-            messages.push(InternalMessage {
+            messages.push(Message {
                 role: Role::System,
                 content: MessageContent::Text(inst.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
-                extra: HashMap::new(),
+                meta: None,
             });
         }
 
+        // ── Input items ───────────────────────────────────────────────────────
         let input = obj
             .get("input")
             .ok_or_else(|| anyhow::anyhow!("missing 'input' field"))?;
 
         match input {
             Value::String(text) => {
-                messages.push(InternalMessage {
+                messages.push(Message {
                     role: Role::User,
                     content: MessageContent::Text(text.clone()),
                     tool_calls: None,
                     tool_call_id: None,
-                    extra: HashMap::new(),
+                    meta: None,
                 });
             }
             Value::Array(items) => {
                 let mut pending_reasoning: Option<String> = None;
-                let mut pending_reasoning_attached = false;
                 for item in items {
-                    // Preserve reasoning_content from Responses API "reasoning" items.
-                    // DeepSeek requires that reasoning_content be passed back on the
-                    // assistant message that produced it. Codex represents reasoning as
-                    // a separate "reasoning" item in the input array; we attach it to the
-                    // next assistant message via the `extra` field.
                     if item
                         .get("type")
                         .and_then(|v| v.as_str())
                         .is_some_and(|t| t == "reasoning")
                     {
-                        if let Some(reasoning) = responses_item_reasoning_content(item) {
-                            pending_reasoning = Some(reasoning);
-                            pending_reasoning_attached = false;
+                        if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
+                            for s in summary {
+                                if let Some(text) = s.get("text").and_then(|v| v.as_str()) {
+                                    if !text.is_empty() {
+                                        pending_reasoning = Some(text.to_string());
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         continue;
                     }
@@ -124,80 +113,47 @@ impl IngressDecoder for ResponsesDecoder {
                     match decode_input_item(item)? {
                         Some(mut msg) => {
                             if msg.role == Role::Assistant {
-                                let item_reasoning = responses_item_reasoning_content(item);
-                                // Clone reasoning to EACH consecutive assistant message.
-                                // Parallel function_calls produce multiple assistant messages
-                                // that all belong to the same reasoning turn; each must carry
-                                // reasoning_content. Tool results interleaved between
-                                // function_calls are NOT turn boundaries — keep reasoning alive.
-                                let reasoning = match (pending_reasoning.as_ref(), item_reasoning) {
-                                    (Some(pending), Some(item)) => {
-                                        Some(format!("{pending}\n{item}"))
-                                    }
-                                    (Some(pending), None) => Some(pending.clone()),
-                                    (None, Some(item)) => Some(item),
-                                    (None, None) => None,
-                                };
-                                if let Some(reasoning) = reasoning {
-                                    msg.extra.insert(
+                                if let Some(ref reasoning) = pending_reasoning {
+                                    let mut obj = match msg.meta.take() {
+                                        Some(Value::Object(m)) => m,
+                                        _ => serde_json::Map::new(),
+                                    };
+                                    obj.insert(
                                         "reasoning_content".to_string(),
-                                        Value::String(reasoning),
+                                        Value::String(reasoning.clone()),
                                     );
-                                    pending_reasoning_attached = true;
+                                    msg.meta = Some(Value::Object(obj));
                                 }
                             } else if msg.role == Role::User || msg.role == Role::System {
-                                // User/System messages are true conversation turn boundaries.
-                                // If pending reasoning was never attached to an assistant
-                                // message, emit it as a standalone assistant now.  If it was
-                                // already attached to one or more assistant function_call
-                                // messages, drop it here; otherwise the end-of-turn flush can
-                                // synthesize a trailing assistant whose only Anthropic block is
-                                // `thinking`, which Claude rejects.
-                                if let Some(reasoning) = pending_reasoning.take()
-                                    && !pending_reasoning_attached
-                                {
-                                    let mut extra = HashMap::new();
+                                if let Some(reasoning) = pending_reasoning.take() {
+                                    let mut extra = serde_json::Map::new();
                                     extra.insert(
                                         "reasoning_content".to_string(),
                                         Value::String(reasoning),
                                     );
-                                    messages.push(InternalMessage {
+                                    messages.push(Message {
                                         role: Role::Assistant,
                                         content: MessageContent::Text(String::new()),
                                         tool_calls: None,
                                         tool_call_id: None,
-                                        extra,
+                                        meta: Some(Value::Object(extra)),
                                     });
                                 }
-                                pending_reasoning_attached = false;
                             }
-                            // Tool outputs and other non-assistant types: leave
-                            // pending_reasoning intact — they sit between calls of the
-                            // same reasoning turn and do not end the turn.
                             messages.push(msg);
                         }
-                        None => {
-                            // If the item produced no message (e.g., an ignored type)
-                            // but we have pending reasoning, keep it for the next one.
-                        }
+                        None => {}
                     }
                 }
-                // Flush any remaining pending reasoning at end of input only if it
-                // was never attached to an assistant item.  Codex often emits an
-                // empty assistant message after function_call; decoding that to None
-                // used to leave the pending reasoning alive and create a trailing
-                // assistant containing only `thinking` on Anthropic.
-                if let Some(reasoning) = pending_reasoning.take()
-                    && !pending_reasoning_attached
-                {
-                    let mut extra = HashMap::new();
+                if let Some(reasoning) = pending_reasoning.take() {
+                    let mut extra = serde_json::Map::new();
                     extra.insert("reasoning_content".to_string(), Value::String(reasoning));
-                    messages.push(InternalMessage {
+                    messages.push(Message {
                         role: Role::Assistant,
                         content: MessageContent::Text(String::new()),
                         tool_calls: None,
                         tool_call_id: None,
-                        extra,
+                        meta: Some(Value::Object(extra)),
                     });
                 }
             }
@@ -208,14 +164,50 @@ impl IngressDecoder for ResponsesDecoder {
             anyhow::bail!("no messages found in input");
         }
 
-        // ── Build extra from unknown + PR-09 named fields ─────────────────────
-        let mut extra: HashMap<String, Value> = obj
+        // ── Tools ─────────────────────────────────────────────────────────────
+        let tools = parse_tools(obj.get("tools"))?;
+        let tool_choice = obj.get("tool_choice").cloned().map(parse_tool_choice);
+
+        // ── Reasoning ─────────────────────────────────────────────────────────
+        let reasoning = if let Some(r) = obj.get("reasoning") {
+            let effort_str = r.get("effort").and_then(|e| e.as_str());
+            let summary = r.get("summary").and_then(|s| s.as_str()).map(String::from);
+            ReasoningConfig {
+                enabled: true,
+                effort: effort_str.map(parse_reasoning_effort),
+                display: summary,
+                ..Default::default()
+            }
+        } else {
+            ReasoningConfig::default()
+        };
+
+        // ── ProtocolExt ───────────────────────────────────────────────────────
+        let resp_ext = OpenAIResponsesExt {
+            background: obj.get("background").and_then(|v| v.as_bool()),
+            previous_response_id: obj
+                .get("previous_response_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            truncation: obj
+                .get("truncation")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            include: obj.get("include").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            }),
+            ..Default::default()
+        };
+
+        // ── Vendor ingress bag — backward compat for old encoders (pre-PR-3) ──
+        let mut ingress: HashMap<String, Value> = obj
             .iter()
             .filter(|(k, _)| !KNOWN_FIELDS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // Carry PR-09 named fields explicitly so the encoder can forward them.
         for key in &[
             "background",
             "previous_response_id",
@@ -230,84 +222,37 @@ impl IngressDecoder for ResponsesDecoder {
             "user",
         ] {
             if let Some(v) = obj.get(*key) {
-                extra.entry(key.to_string()).or_insert_with(|| v.clone());
+                ingress.entry(key.to_string()).or_insert_with(|| v.clone());
             }
         }
 
-        Ok(InternalRequest {
-            messages,
-            model,
-            stream,
+        // ── Build AiRequest ───────────────────────────────────────────────────
+        let mut ai_req = AiRequest::new(model, messages);
+        ai_req.generation = GenerationConfig {
             temperature,
             max_tokens,
             top_p,
-            tools,
-            tool_choice,
-            source_protocol: OPENAI_RESPONSES_V1,
-            extra,
-        })
+            ..Default::default()
+        };
+        ai_req.stream = StreamConfig {
+            enabled: stream,
+            include_usage: false,
+        };
+        ai_req.tools = tools;
+        ai_req.tool_choice = tool_choice;
+        ai_req.parallel_tool_calls = parallel_tool_calls;
+        ai_req.reasoning = reasoning;
+        ai_req.ext = Some(ProtocolExt::OpenAiResponses(resp_ext));
+        ai_req.meta.source_protocol = Some(OPENAI_RESPONSES_V1);
+        ai_req.meta.vendor.ingress = ingress;
+
+        Ok(ai_req)
     }
 }
 
-fn responses_item_reasoning_content(item: &Value) -> Option<String> {
-    if let Some(reasoning_content) = item
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .filter(|text| !text.is_empty())
-    {
-        return Some(reasoning_content.to_string());
-    }
-    if let Some(encrypted_content) = item
-        .get("encrypted_content")
-        .and_then(|v| v.as_str())
-        .filter(|text| !text.is_empty())
-    {
-        return Some(encrypted_content.to_string());
-    }
-    if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
-        let texts = summary
-            .iter()
-            .filter_map(|s| s.get("text").and_then(|v| v.as_str()))
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if !texts.is_empty() {
-            return Some(texts.join("\n"));
-        }
-    }
-    item.get("content")
-        .and_then(|v| v.as_array())
-        .map(|content| {
-            content
-                .iter()
-                .filter_map(|part| {
-                    part.get("reasoning")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| {
-                            (part.get("type").and_then(|v| v.as_str()) == Some("reasoning_text"))
-                                .then(|| part.get("text").and_then(|v| v.as_str()))
-                                .flatten()
-                        })
-                        .filter(|text| !text.is_empty())
-                        .map(str::to_string)
-                })
-                .collect::<Vec<_>>()
-        })
-        .filter(|texts| !texts.is_empty())
-        .map(|texts| texts.join("\n"))
-}
+// ── Input item decoding ───────────────────────────────────────────────────────
 
-fn decode_input_item(item: &Value) -> Result<Option<InternalMessage>> {
-    if let Some(text) = item.as_str() {
-        return Ok(Some(InternalMessage {
-            role: Role::User,
-            content: MessageContent::Text(text.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            extra: HashMap::new(),
-        }));
-    }
-
+fn decode_input_item(item: &Value) -> Result<Option<Message>> {
     let item_type = item
         .get("type")
         .and_then(|v| v.as_str())
@@ -330,12 +275,12 @@ fn decode_input_item(item: &Value) -> Result<Option<InternalMessage>> {
                 Value::Null => String::new(),
                 other => other.to_string(),
             };
-            Ok(Some(InternalMessage {
+            Ok(Some(Message {
                 role: Role::Tool,
                 content: MessageContent::Text(output_text),
                 tool_calls: None,
                 tool_call_id: Some(call_id),
-                extra: HashMap::new(),
+                meta: None,
             }))
         }
 
@@ -359,7 +304,7 @@ fn decode_input_item(item: &Value) -> Result<Option<InternalMessage>> {
             if call_id.trim().is_empty() || name.trim().is_empty() {
                 anyhow::bail!("function_call item missing call_id or name");
             }
-            Ok(Some(InternalMessage {
+            Ok(Some(Message {
                 role: Role::Assistant,
                 content: MessageContent::Text(String::new()),
                 tool_calls: Some(vec![ToolCall {
@@ -368,12 +313,10 @@ fn decode_input_item(item: &Value) -> Result<Option<InternalMessage>> {
                     arguments,
                 }]),
                 tool_call_id: None,
-                extra: HashMap::new(),
+                meta: None,
             }))
         }
 
-        // PR-09: web_search_call, file_search_call, computer_call — pass through
-        // silently; their results are provided via `function_call_output`.
         "web_search_call" | "file_search_call" | "computer_call" | "reasoning" => Ok(None),
 
         "message" => decode_message_item(item),
@@ -382,7 +325,7 @@ fn decode_input_item(item: &Value) -> Result<Option<InternalMessage>> {
     }
 }
 
-fn decode_message_item(item: &Value) -> Result<Option<InternalMessage>> {
+fn decode_message_item(item: &Value) -> Result<Option<Message>> {
     let role_str = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
     let role = match role_str {
         "system" | "developer" => Role::System,
@@ -394,14 +337,6 @@ fn decode_message_item(item: &Value) -> Result<Option<InternalMessage>> {
 
     let content = match item.get("content") {
         Some(Value::String(text)) => MessageContent::Text(text.clone()),
-        Some(Value::Object(object)) => MessageContent::Text(
-            object
-                .get("text")
-                .and_then(|v| v.as_str())
-                .or_else(|| object.get("content").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_string(),
-        ),
         Some(Value::Array(blocks)) => {
             let mut texts = Vec::new();
             for block in blocks {
@@ -412,12 +347,7 @@ fn decode_message_item(item: &Value) -> Result<Option<InternalMessage>> {
                             texts.push(text.to_string());
                         }
                     }
-                    "image_url" => {
-                        // Skip images in text accumulator; they'll be handled by multimodal codecs.
-                    }
-                    _ => {
-                        // Ignore unknown block types (e.g. `input_audio`, `reasoning_summary`).
-                    }
+                    _ => {}
                 }
             }
             let text = texts.join("");
@@ -430,16 +360,18 @@ fn decode_message_item(item: &Value) -> Result<Option<InternalMessage>> {
         None => return Ok(None),
     };
 
-    Ok(Some(InternalMessage {
+    Ok(Some(Message {
         role,
         content,
         tool_calls: None,
         tool_call_id: None,
-        extra: HashMap::new(),
+        meta: None,
     }))
 }
 
-fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolDef>>> {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolSpec>>> {
     let Some(Value::Array(items)) = raw_tools else {
         return Ok(None);
     };
@@ -466,24 +398,26 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolDef>>> {
                     .get("parameters")
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
-                tools.push(ToolDef {
+                tools.push(ToolSpec {
                     name,
                     description,
                     parameters,
+                    strict: item.get("strict").and_then(|v| v.as_bool()),
+                    cache_control: None,
+                    meta: None,
                 });
             }
-            // PR-09: built-in tools preserved as sentinel ToolDef entries
-            // so the encoder can reconstruct them on the egress side.
             "web_search_preview" | "file_search" | "computer_use_preview" | "code_interpreter" => {
-                tools.push(ToolDef {
+                tools.push(ToolSpec {
                     name: format!("__builtin__{}", tool_type),
                     description: Some(format!("built-in tool: {}", tool_type)),
                     parameters: item.clone(),
+                    strict: None,
+                    cache_control: None,
+                    meta: None,
                 });
             }
-            _ => {
-                // Ignore unknown tool types.
-            }
+            _ => {}
         }
     }
 
@@ -491,5 +425,40 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolDef>>> {
         Ok(None)
     } else {
         Ok(Some(tools))
+    }
+}
+
+fn parse_tool_choice(v: Value) -> ToolChoice {
+    match &v {
+        Value::String(s) => match s.as_str() {
+            "none" => ToolChoice::None,
+            "auto" => ToolChoice::Auto,
+            "required" => ToolChoice::Required,
+            _ => ToolChoice::Raw(v),
+        },
+        Value::Object(obj) => {
+            if obj.get("type").and_then(|t| t.as_str()) == Some("function") {
+                if let Some(name) = obj
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    return ToolChoice::Named {
+                        name: name.to_string(),
+                    };
+                }
+            }
+            ToolChoice::Raw(v)
+        }
+        _ => ToolChoice::Raw(v),
+    }
+}
+
+fn parse_reasoning_effort(s: &str) -> crate::protocol::ir::ReasoningEffort {
+    use crate::protocol::ir::ReasoningEffort;
+    match s {
+        "low" => ReasoningEffort::Low,
+        "high" => ReasoningEffort::High,
+        _ => ReasoningEffort::Medium,
     }
 }

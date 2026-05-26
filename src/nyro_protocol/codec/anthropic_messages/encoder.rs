@@ -1,21 +1,22 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
-use crate::protocol::EgressEncoder;
-use crate::protocol::types::*;
+use crate::protocol::RequestEncoder;
+use crate::protocol::ir::AiRequest;
+use crate::protocol::ir::request::{
+    ContentBlock, MediaSource, Message, MessageContent, Role, ToolChoice,
+};
 
 pub struct AnthropicEncoder;
 
-impl EgressEncoder for AnthropicEncoder {
-    fn encode_request(&self, req: &InternalRequest) -> Result<(Value, HeaderMap)> {
+impl RequestEncoder for AnthropicEncoder {
+    fn encode_request(&self, req: &AiRequest) -> Result<(Value, HeaderMap)> {
+        let ingress = &req.meta.vendor.ingress;
+
         // ── System ────────────────────────────────────────────────────────────
         // Prefer __anthropic_raw_system (preserves cache_control) if present.
-        let system_val: Option<Value> = if let Some(v) = req.extra.get("__anthropic_raw_system") {
+        let system_val: Option<Value> = if let Some(v) = ingress.get("__anthropic_raw_system") {
             Some(v.clone())
         } else {
             let mut system_text = String::new();
@@ -24,7 +25,7 @@ impl EgressEncoder for AnthropicEncoder {
                     if !system_text.is_empty() {
                         system_text.push('\n');
                     }
-                    system_text.push_str(&msg.content.as_text());
+                    system_text.push_str(&msg.content.to_text());
                 }
             }
             if system_text.is_empty() {
@@ -36,8 +37,8 @@ impl EgressEncoder for AnthropicEncoder {
 
         // ── Messages ──────────────────────────────────────────────────────────
         // Prefer __anthropic_raw_messages (preserves cache_control / exotic
-        // blocks) if present; otherwise reconstruct from InternalMessage.
-        let messages_val: Value = if let Some(v) = req.extra.get("__anthropic_raw_messages") {
+        // blocks) if present; otherwise reconstruct from Message.
+        let messages_val: Value = if let Some(v) = ingress.get("__anthropic_raw_messages") {
             v.clone()
         } else {
             let mut raw_messages = Vec::new();
@@ -50,20 +51,13 @@ impl EgressEncoder for AnthropicEncoder {
             Value::Array(normalize_anthropic_messages(raw_messages))
         };
 
-        let reasoning_effort = responses_reasoning_effort(req);
-        let thinking_budget = reasoning_effort.and_then(anthropic_budget_tokens);
-        let mut max_tokens = req.max_tokens.unwrap_or(4096);
-        if let Some(budget_tokens) = thinking_budget
-            && max_tokens <= budget_tokens
-        {
-            max_tokens = budget_tokens.saturating_add(1024);
-        }
+        let max_tokens = req.generation.max_tokens.unwrap_or(4096);
 
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": messages_val,
             "max_tokens": max_tokens,
-            "stream": req.stream,
+            "stream": req.stream.enabled,
         });
 
         let obj = body.as_object_mut().unwrap();
@@ -71,40 +65,22 @@ impl EgressEncoder for AnthropicEncoder {
         if let Some(sv) = system_val {
             obj.insert("system".into(), sv);
         }
-        if let Some(t) = req.temperature {
+        if let Some(t) = req.generation.temperature {
             obj.insert("temperature".into(), t.into());
         }
-        if let Some(p) = req.top_p {
+        if let Some(p) = req.generation.top_p {
             obj.insert("top_p".into(), p.into());
-        }
-        if let Some(budget_tokens) = thinking_budget {
-            obj.insert(
-                "thinking".into(),
-                serde_json::json!({
-                    "type": "enabled",
-                    "budget_tokens": budget_tokens,
-                }),
-            );
-        }
-        if let Some(effort) = reasoning_effort.and_then(anthropic_effort) {
-            obj.insert(
-                "output_config".into(),
-                serde_json::json!({
-                    "effort": effort,
-                }),
-            );
         }
 
         // ── Tools ─────────────────────────────────────────────────────────────
         // Prefer raw tools (preserves cache_control) if present.
-        if let Some(raw_tools) = req.extra.get("__anthropic_raw_tools") {
+        if let Some(raw_tools) = ingress.get("__anthropic_raw_tools") {
             obj.insert("tools".into(), raw_tools.clone());
         } else if let Some(ref tools) = req.tools {
             let tools_val: Vec<Value> = tools
                 .iter()
                 .map(|t| {
                     if let Some(builtin_type) = t.name.strip_prefix("__builtin__") {
-                        // Reconstruct built-in tool entry.
                         let mut entry = serde_json::json!({
                             "type": builtin_type,
                             "name": builtin_type,
@@ -129,17 +105,16 @@ impl EgressEncoder for AnthropicEncoder {
         }
 
         // ── Tool choice ───────────────────────────────────────────────────────
-        if let Some(mapped_tool_choice) = req
-            .tool_choice
-            .as_ref()
-            .and_then(map_tool_choice_for_anthropic)
-        {
-            obj.insert("tool_choice".into(), mapped_tool_choice);
+        if let Some(ref tc) = req.tool_choice {
+            let raw = tool_choice_to_value_raw(tc);
+            if let Some(mapped) = map_tool_choice_for_anthropic(&raw) {
+                obj.insert("tool_choice".into(), mapped);
+            }
         }
 
-        // ── PR-10 extra fields ────────────────────────────────────────────────
+        // ── Extra fields ──────────────────────────────────────────────────────
         for key in &["__anthropic_thinking", "__anthropic_context_management"] {
-            if let Some(v) = req.extra.get(*key) {
+            if let Some(v) = ingress.get(*key) {
                 let field_name = key.trim_start_matches("__anthropic_");
                 obj.insert(field_name.into(), v.clone());
             }
@@ -151,7 +126,7 @@ impl EgressEncoder for AnthropicEncoder {
             "__anthropic_stop_sequences",
             "__anthropic_top_k",
         ] {
-            if let Some(v) = req.extra.get(*key) {
+            if let Some(v) = ingress.get(*key) {
                 let field_name = key.trim_start_matches("__anthropic_");
                 obj.insert(field_name.into(), v.clone());
             }
@@ -170,35 +145,20 @@ impl EgressEncoder for AnthropicEncoder {
     }
 }
 
-fn responses_reasoning_effort(req: &InternalRequest) -> Option<&str> {
-    req.extra
-        .get("reasoning")
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(|v| v.as_str())
-}
+// ── tool_choice helpers ───────────────────────────────────────────────────────
 
-fn anthropic_effort(effort: &str) -> Option<&'static str> {
-    match effort.to_ascii_lowercase().as_str() {
-        "none" | "minimal" | "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" => Some("high"),
-        "xhigh" | "max" => Some("max"),
-        _ => None,
+fn tool_choice_to_value_raw(tc: &ToolChoice) -> Value {
+    match tc {
+        ToolChoice::Auto => Value::String("auto".into()),
+        ToolChoice::None => Value::String("none".into()),
+        ToolChoice::Required => Value::String("required".into()),
+        ToolChoice::Named { name } => serde_json::json!({
+            "type": "tool",
+            "name": name,
+        }),
+        ToolChoice::Raw(v) => v.clone(),
     }
 }
-
-fn anthropic_budget_tokens(effort: &str) -> Option<u32> {
-    match effort.to_ascii_lowercase().as_str() {
-        "minimal" | "low" => Some(1024),
-        "medium" => Some(4096),
-        "high" => Some(16384),
-        "xhigh" | "max" => Some(32000),
-        "none" => None,
-        _ => None,
-    }
-}
-
-// ── tool_choice mapping ───────────────────────────────────────────────────────
 
 fn map_tool_choice_for_anthropic(raw: &Value) -> Option<Value> {
     if let Some(s) = raw.as_str() {
@@ -373,7 +333,7 @@ fn validate_anthropic_payload(body: &Value) -> Result<()> {
 
 // ── Message encoding helpers ──────────────────────────────────────────────────
 
-fn encode_message(msg: &InternalMessage) -> Result<Value> {
+fn encode_message(msg: &Message) -> Result<Value> {
     let role = match msg.role {
         Role::User | Role::Tool => "user",
         Role::Assistant => "assistant",
@@ -399,35 +359,31 @@ fn encode_message(msg: &InternalMessage) -> Result<Value> {
         }));
     }
 
+    let meta_obj = msg.meta.as_ref().and_then(|m| m.as_object());
     let content = match &msg.content {
         MessageContent::Text(t) => {
-            let reasoning = msg
-                .extra
-                .get("reasoning_content")
+            let reasoning = meta_obj
+                .and_then(|m| m.get("reasoning_content"))
                 .and_then(|v| v.as_str())
                 .filter(|v| !v.trim().is_empty());
-            let reasoning_signature = msg
-                .extra
-                .get("reasoning_signature")
+            let reasoning_signature = meta_obj
+                .and_then(|m| m.get("reasoning_signature"))
                 .and_then(|v| v.as_str())
                 .filter(|v| !v.trim().is_empty());
 
-            // Native Anthropic thinking can only be replayed when we have
-            // the provider-issued signature.  Codex/OpenAI Responses reasoning
-            // summaries are not valid Anthropic thinking blocks: omitting the
-            // signature fails as `Field required`, while sending an empty one
-            // fails as `Invalid signature`.  Preserve signed Anthropic thinking,
-            // but do not synthesize unsigned thinking from a summary.
-            let signed_reasoning = reasoning.zip(reasoning_signature);
-
-            if signed_reasoning.is_some() || msg.tool_calls.is_some() {
+            if reasoning.is_some() || msg.tool_calls.is_some() {
                 let mut blocks: Vec<Value> = vec![];
-                if let Some((text, signature)) = signed_reasoning {
-                    blocks.push(serde_json::json!({
+                if let Some(text) = reasoning {
+                    let mut block = serde_json::json!({
                         "type": "thinking",
                         "thinking": text,
-                        "signature": signature,
-                    }));
+                    });
+                    if let Some(signature) = reasoning_signature
+                        && let Some(obj) = block.as_object_mut()
+                    {
+                        obj.insert("signature".into(), serde_json::json!(signature));
+                    }
+                    blocks.push(block);
                 }
                 if !t.is_empty() {
                     blocks.push(serde_json::json!({"type": "text", "text": t}));
@@ -452,52 +408,7 @@ fn encode_message(msg: &InternalMessage) -> Result<Value> {
         MessageContent::Blocks(blocks) => {
             let arr: Vec<Value> = blocks
                 .iter()
-                .map(|b| match b {
-                    ContentBlock::Text { text } => {
-                        serde_json::json!({"type": "text", "text": text})
-                    }
-                    ContentBlock::Image { source } => {
-                        serde_json::json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": source.media_type,
-                                "data": source.data,
-                            }
-                        })
-                    }
-                    ContentBlock::Reasoning { text, signature } => {
-                        if let Some(sig) = signature
-                            && !sig.trim().is_empty()
-                        {
-                            serde_json::json!({
-                                "type": "thinking",
-                                "thinking": text,
-                                "signature": sig,
-                            })
-                        } else {
-                            serde_json::json!({"type": "text", "text": ""})
-                        }
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        serde_json::json!({
-                            "type": "tool_use",
-                            "id": normalize_anthropic_tool_id(id),
-                            "name": name,
-                            "input": input,
-                        })
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                    } => {
-                        serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": normalize_anthropic_tool_id(tool_use_id),
-                            "content": content,
-                        })
-                    }
-                })
+                .map(|b| encode_content_block_for_anthropic(b))
                 .collect();
             Value::Array(arr)
         }
@@ -509,7 +420,104 @@ fn encode_message(msg: &InternalMessage) -> Result<Value> {
     }))
 }
 
-fn anthropic_tool_result_payload(msg: &InternalMessage) -> (Value, Option<String>) {
+fn encode_content_block_for_anthropic(b: &ContentBlock) -> Value {
+    match b {
+        ContentBlock::Text {
+            text,
+            cache_control,
+        } => {
+            let mut block = serde_json::json!({"type": "text", "text": text});
+            if let Some(cc) = cache_control {
+                block["cache_control"] = serde_json::to_value(cc).unwrap_or(Value::Null);
+            }
+            block
+        }
+        ContentBlock::Image {
+            source,
+            cache_control,
+        } => {
+            let src = match source {
+                MediaSource::Base64 { media_type, data } => serde_json::json!({
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                }),
+                MediaSource::Url(url) => serde_json::json!({
+                    "type": "url",
+                    "url": url,
+                }),
+                MediaSource::FileId { file_id, .. } => serde_json::json!({
+                    "type": "file",
+                    "file_id": file_id,
+                }),
+            };
+            let mut block = serde_json::json!({"type": "image", "source": src});
+            if let Some(cc) = cache_control {
+                block["cache_control"] = serde_json::to_value(cc).unwrap_or(Value::Null);
+            }
+            block
+        }
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            let mut block = serde_json::json!({
+                "type": "thinking",
+                "thinking": thinking,
+            });
+            if let Some(sig) = signature
+                && !sig.trim().is_empty()
+                && let Some(obj) = block.as_object_mut()
+            {
+                obj.insert("signature".into(), serde_json::json!(sig));
+            }
+            block
+        }
+        ContentBlock::RedactedThinking { data } => {
+            serde_json::json!({"type": "redacted_thinking", "data": data})
+        }
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            cache_control,
+        } => {
+            let mut block = serde_json::json!({
+                "type": "tool_use",
+                "id": normalize_anthropic_tool_id(id),
+                "name": name,
+                "input": input,
+            });
+            if let Some(cc) = cache_control {
+                block["cache_control"] = serde_json::to_value(cc).unwrap_or(Value::Null);
+            }
+            block
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            cache_control,
+        } => {
+            let mut block = serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": normalize_anthropic_tool_id(tool_use_id),
+                "content": content,
+            });
+            if let Some(err) = is_error {
+                block["is_error"] = Value::Bool(*err);
+            }
+            if let Some(cc) = cache_control {
+                block["cache_control"] = serde_json::to_value(cc).unwrap_or(Value::Null);
+            }
+            block
+        }
+        ContentBlock::Unknown { raw } => raw.clone(),
+        other => serde_json::to_value(other).unwrap_or(Value::Null),
+    }
+}
+
+fn anthropic_tool_result_payload(msg: &Message) -> (Value, Option<String>) {
     match &msg.content {
         MessageContent::Text(t) => (Value::String(t.clone()), None),
         MessageContent::Blocks(blocks) => {
@@ -517,12 +525,13 @@ fn anthropic_tool_result_payload(msg: &InternalMessage) -> (Value, Option<String
                 if let ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    ..
                 } = block
                 {
                     return (content.clone(), Some(tool_use_id.clone()));
                 }
             }
-            (Value::String(msg.content.as_text()), None)
+            (Value::String(msg.content.to_text()), None)
         }
     }
 }

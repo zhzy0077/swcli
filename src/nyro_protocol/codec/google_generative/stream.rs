@@ -1,20 +1,19 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::protocol::types::*;
+use crate::protocol::ir::request::ToolCall;
+use crate::protocol::ir::response::ResponseItem;
+use crate::protocol::ir::usage::Usage;
+use crate::protocol::ir::{AiResponse, AiStreamDelta};
 use crate::protocol::*;
 
 // ── Non-streaming response parser ──
 
 pub struct GoogleResponseParser;
 
-impl ResponseParser for GoogleResponseParser {
-    fn parse_response(&self, resp: Value) -> Result<InternalResponse> {
+impl ResponseDecoder for GoogleResponseParser {
+    fn parse_response(&self, resp: Value) -> Result<AiResponse> {
         let candidate = resp
             .get("candidates")
             .and_then(|c| c.as_array())
@@ -24,6 +23,7 @@ impl ResponseParser for GoogleResponseParser {
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
+        let mut items = Vec::new();
 
         if let Some(parts) = content_obj
             .and_then(|c| c.get("parts"))
@@ -32,7 +32,16 @@ impl ResponseParser for GoogleResponseParser {
             for part in parts {
                 if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                     text.push_str(t);
+                    if is_plain_text_part(part) {
+                        items.push(ResponseItem::OutputText {
+                            text: t.to_string(),
+                        });
+                    } else {
+                        items.push(ResponseItem::Unknown { raw: part.clone() });
+                    }
+                    continue;
                 }
+
                 if let Some(fc) = part.get("functionCall") {
                     let name = fc
                         .get("name")
@@ -43,12 +52,26 @@ impl ResponseParser for GoogleResponseParser {
                         .get("args")
                         .cloned()
                         .unwrap_or(Value::Object(Default::default()));
+                    let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    let arguments = args.to_string();
                     tool_calls.push(ToolCall {
-                        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                        name,
-                        arguments: args.to_string(),
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
                     });
+                    if is_plain_function_call_part(part) {
+                        items.push(ResponseItem::FunctionCall {
+                            call_id,
+                            name,
+                            arguments,
+                        });
+                    } else {
+                        items.push(ResponseItem::Unknown { raw: part.clone() });
+                    }
+                    continue;
                 }
+
+                items.push(ResponseItem::Unknown { raw: part.clone() });
             }
         }
 
@@ -68,18 +91,20 @@ impl ResponseParser for GoogleResponseParser {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let response_id = resp
+            .get("responseId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("gen-{}", uuid::Uuid::new_v4().simple()));
 
-        Ok(InternalResponse {
-            id: format!("gen-{}", uuid::Uuid::new_v4().simple()),
-            model,
-            content: text,
-            reasoning_content: None,
-            reasoning_signature: None,
-            tool_calls,
-            response_items: None,
-            stop_reason,
-            usage,
-        })
+        let mut ai_resp = AiResponse::new(response_id, model);
+        ai_resp.content = text;
+        ai_resp.tool_calls = tool_calls;
+        ai_resp.items = if items.is_empty() { None } else { Some(items) };
+        ai_resp.stop_reason = stop_reason;
+        ai_resp.usage = usage;
+        preserve_google_response_metadata(&mut ai_resp, &resp);
+        Ok(ai_resp)
     }
 }
 
@@ -87,21 +112,9 @@ impl ResponseParser for GoogleResponseParser {
 
 pub struct GoogleResponseFormatter;
 
-impl ResponseFormatter for GoogleResponseFormatter {
-    fn format_response(&self, resp: &InternalResponse) -> Value {
-        let mut parts = Vec::new();
-
-        if !resp.content.is_empty() {
-            parts.push(serde_json::json!({"text": resp.content}));
-        }
-
-        for tc in &resp.tool_calls {
-            let args: Value =
-                serde_json::from_str(&tc.arguments).unwrap_or(Value::Object(Default::default()));
-            parts.push(serde_json::json!({
-                "functionCall": {"name": tc.name, "args": args}
-            }));
-        }
+impl ResponseEncoder for GoogleResponseFormatter {
+    fn format_response(&self, resp: &AiResponse) -> Value {
+        let parts = google_parts_from_response(resp);
 
         let finish_reason = resp.stop_reason.as_deref().map(|r| match r {
             "stop" => "STOP",
@@ -110,17 +123,15 @@ impl ResponseFormatter for GoogleResponseFormatter {
             other => other,
         });
 
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": parts},
                 "finishReason": finish_reason,
             }],
-            "usageMetadata": {
-                "promptTokenCount": resp.usage.input_tokens,
-                "candidatesTokenCount": resp.usage.output_tokens,
-                "totalTokenCount": resp.usage.input_tokens + resp.usage.output_tokens,
-            }
-        })
+            "usageMetadata": google_usage_metadata(resp)
+        });
+        add_preserved_google_response_metadata(&mut out, resp);
+        out
     }
 }
 
@@ -146,8 +157,8 @@ impl GoogleStreamParser {
     }
 }
 
-impl StreamParser for GoogleStreamParser {
-    fn parse_chunk(&mut self, raw: &str) -> Result<Vec<StreamDelta>> {
+impl StreamResponseDecoder for GoogleStreamParser {
+    fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
         self.buffer.push_str(raw);
         let mut deltas = Vec::new();
 
@@ -155,20 +166,26 @@ impl StreamParser for GoogleStreamParser {
             let block = self.buffer[..pos].to_string();
             self.buffer = self.buffer[pos + 2..].to_string();
 
+            let mut saw_sse_data = false;
             for line in block.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
+                    saw_sse_data = true;
                     let data = data.trim();
                     if let Ok(chunk) = serde_json::from_str::<Value>(data) {
                         parse_gemini_chunk(&chunk, &mut deltas, &mut self.first);
                     }
                 }
             }
+
+            if !saw_sse_data && let Ok(chunk) = serde_json::from_str::<Value>(block.trim()) {
+                parse_gemini_chunk(&chunk, &mut deltas, &mut self.first);
+            }
         }
 
         Ok(deltas)
     }
 
-    fn finish(&mut self) -> Result<Vec<StreamDelta>> {
+    fn finish(&mut self) -> Result<Vec<AiStreamDelta>> {
         if self.buffer.trim().is_empty() {
             return Ok(vec![]);
         }
@@ -177,7 +194,7 @@ impl StreamParser for GoogleStreamParser {
     }
 }
 
-fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<StreamDelta>, first: &mut bool) {
+fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<AiStreamDelta>, first: &mut bool) {
     if *first {
         *first = false;
         let model = chunk
@@ -185,7 +202,7 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<StreamDelta>, first: &mut 
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        deltas.push(StreamDelta::MessageStart {
+        deltas.push(AiStreamDelta::MessageStart {
             id: format!("gen-{}", uuid::Uuid::new_v4().simple()),
             model,
         });
@@ -202,32 +219,61 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<StreamDelta>, first: &mut 
         .and_then(|p| p.as_array())
     {
         for part in parts {
-            if let Some(text) = part.get("text").and_then(|t| t.as_str())
-                && !text.is_empty()
-            {
-                deltas.push(StreamDelta::TextDelta(text.to_string()));
-            }
-            if let Some(fc) = part.get("functionCall") {
-                let name = fc
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-                deltas.push(StreamDelta::ToolCallStart {
-                    index: 0,
-                    id,
-                    name: name.clone(),
-                });
-                let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
-                if !args.is_empty() && args != "{}" {
-                    deltas.push(StreamDelta::ToolCallDelta {
-                        index: 0,
-                        arguments: args,
+            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                if is_plain_text_part(part) {
+                    if !text.is_empty() {
+                        deltas.push(AiStreamDelta::TextDelta(text.to_string()));
+                    }
+                } else {
+                    deltas.push(AiStreamDelta::Unknown {
+                        raw: part.to_string(),
                     });
                 }
+                continue;
             }
+
+            if let Some(fc) = part.get("functionCall") {
+                if is_plain_function_call_part(part) {
+                    let name = fc
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    deltas.push(AiStreamDelta::ToolCallStart {
+                        index: 0,
+                        id,
+                        name: name.clone(),
+                    });
+                    let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
+                    if !args.is_empty() && args != "{}" {
+                        deltas.push(AiStreamDelta::ToolCallDelta {
+                            index: 0,
+                            arguments: args,
+                        });
+                    }
+                } else {
+                    deltas.push(AiStreamDelta::Unknown {
+                        raw: part.to_string(),
+                    });
+                }
+                continue;
+            }
+
+            deltas.push(AiStreamDelta::Unknown {
+                raw: part.to_string(),
+            });
         }
+    }
+
+    let u = extract_gemini_usage(chunk);
+    if u.prompt_tokens > 0 || u.completion_tokens > 0 {
+        deltas.push(AiStreamDelta::Usage(u));
+    }
+    if let Some(metadata) = google_stream_metadata(chunk) {
+        deltas.push(AiStreamDelta::Unknown {
+            raw: serde_json::json!({"__google_response_metadata": metadata}).to_string(),
+        });
     }
 
     if let Some(reason) = candidate
@@ -239,24 +285,20 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<StreamDelta>, first: &mut 
             "MAX_TOKENS" => "length",
             other => other,
         };
-        deltas.push(StreamDelta::Done {
+        deltas.push(AiStreamDelta::Done {
             stop_reason: normalized.to_string(),
         });
-    }
-
-    let u = extract_gemini_usage(chunk);
-    if u.input_tokens > 0 || u.output_tokens > 0 {
-        deltas.push(StreamDelta::Usage(u));
     }
 }
 
 // ── Stream formatter (deltas → Gemini SSE) ──
 
 pub struct GoogleStreamFormatter {
-    usage: TokenUsage,
+    usage: Usage,
     model: String,
     tool_names: HashMap<usize, String>,
     tool_arg_buffers: HashMap<usize, String>,
+    response_metadata: serde_json::Map<String, Value>,
 }
 
 impl Default for GoogleStreamFormatter {
@@ -268,24 +310,25 @@ impl Default for GoogleStreamFormatter {
 impl GoogleStreamFormatter {
     pub fn new() -> Self {
         Self {
-            usage: TokenUsage::default(),
+            usage: Usage::default(),
             model: String::new(),
             tool_names: HashMap::new(),
             tool_arg_buffers: HashMap::new(),
+            response_metadata: serde_json::Map::new(),
         }
     }
 }
 
-impl StreamFormatter for GoogleStreamFormatter {
-    fn format_deltas(&mut self, deltas: &[StreamDelta]) -> Vec<SseEvent> {
+impl StreamResponseEncoder for GoogleStreamFormatter {
+    fn format_deltas(&mut self, deltas: &[AiStreamDelta]) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         for delta in deltas {
             match delta {
-                StreamDelta::MessageStart { model, .. } => {
+                AiStreamDelta::MessageStart { model, .. } => {
                     self.model = model.clone();
                 }
-                StreamDelta::ReasoningDelta(text) => {
+                AiStreamDelta::ThinkingDelta(text) => {
                     let chunk = serde_json::json!({
                         "candidates": [{
                             "content": {"role": "model", "parts": [{"text": text}]},
@@ -294,8 +337,8 @@ impl StreamFormatter for GoogleStreamFormatter {
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
-                StreamDelta::ReasoningSignature(_) => {}
-                StreamDelta::TextDelta(text) => {
+                AiStreamDelta::ThinkingSignature(_) => {}
+                AiStreamDelta::TextDelta(text) => {
                     let chunk = serde_json::json!({
                         "candidates": [{
                             "content": {"role": "model", "parts": [{"text": text}]},
@@ -304,11 +347,11 @@ impl StreamFormatter for GoogleStreamFormatter {
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
-                StreamDelta::ToolCallStart { index, id: _, name } => {
+                AiStreamDelta::ToolCallStart { index, id: _, name } => {
                     self.tool_names.insert(*index, name.clone());
                     self.tool_arg_buffers.insert(*index, String::new());
                 }
-                StreamDelta::ToolCallDelta { index, arguments } => {
+                AiStreamDelta::ToolCallDelta { index, arguments } => {
                     let Some(name) = self.tool_names.get(index).cloned() else {
                         continue;
                     };
@@ -327,34 +370,59 @@ impl StreamFormatter for GoogleStreamFormatter {
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
-                StreamDelta::Usage(u) => {
-                    if u.input_tokens > 0 {
-                        self.usage.input_tokens = u.input_tokens;
+                AiStreamDelta::Usage(u) => {
+                    if u.prompt_tokens > 0 {
+                        self.usage.prompt_tokens = u.prompt_tokens;
                     }
-                    if u.output_tokens > 0 {
-                        self.usage.output_tokens = u.output_tokens;
+                    if u.completion_tokens > 0 {
+                        self.usage.completion_tokens = u.completion_tokens;
                     }
                 }
-                StreamDelta::RawEvent { .. } => {}
-                StreamDelta::Done { stop_reason } => {
+                AiStreamDelta::Unknown { raw } => {
+                    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+                        continue;
+                    };
+                    if let Some(metadata) = value
+                        .get("__google_response_metadata")
+                        .and_then(Value::as_object)
+                    {
+                        merge_json_object(&mut self.response_metadata, metadata);
+                        continue;
+                    }
+                    let chunk = serde_json::json!({
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [value]},
+                        }],
+                        "modelVersion": self.model,
+                    });
+                    events.push(SseEvent::new(None, chunk.to_string()));
+                }
+                AiStreamDelta::Done { stop_reason } => {
                     let gemini_reason = match stop_reason.as_str() {
                         "stop" => "STOP",
                         "length" => "MAX_TOKENS",
                         other => other,
                     };
-                    let chunk = serde_json::json!({
+                    let mut chunk = serde_json::json!({
                         "candidates": [{
                             "content": {"role": "model", "parts": []},
                             "finishReason": gemini_reason,
                         }],
-                        "usageMetadata": {
-                            "promptTokenCount": self.usage.input_tokens,
-                            "candidatesTokenCount": self.usage.output_tokens,
-                            "totalTokenCount": self.usage.input_tokens + self.usage.output_tokens,
-                        }
+                        "usageMetadata": merge_usage_counts(
+                            self.response_metadata
+                                .get("usageMetadata")
+                                .cloned()
+                                .unwrap_or_else(|| google_usage_from_counts(&self.usage)),
+                            &AiResponse {
+                                usage: self.usage.clone(),
+                                ..AiResponse::new("", self.model.clone())
+                            },
+                        )
                     });
+                    add_stream_response_metadata(&mut chunk, &self.response_metadata);
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
+                _ => {}
             }
         }
 
@@ -365,18 +433,261 @@ impl StreamFormatter for GoogleStreamFormatter {
         vec![]
     }
 
-    fn usage(&self) -> TokenUsage {
+    fn usage(&self) -> Usage {
         self.usage.clone()
     }
 }
 
-fn extract_gemini_usage(v: &Value) -> TokenUsage {
+fn google_parts_from_response(resp: &AiResponse) -> Vec<Value> {
+    if let Some(items) = &resp.items {
+        let mut parts = Vec::new();
+        for item in items {
+            match item {
+                ResponseItem::OutputText { text } if !text.is_empty() => {
+                    parts.push(serde_json::json!({"text": text}));
+                }
+                ResponseItem::FunctionCall {
+                    name, arguments, ..
+                } => {
+                    let args: Value = serde_json::from_str(arguments)
+                        .unwrap_or(Value::Object(Default::default()));
+                    parts.push(serde_json::json!({
+                        "functionCall": {"name": name, "args": args}
+                    }));
+                }
+                ResponseItem::Unknown { raw } => {
+                    parts.push(raw.clone());
+                }
+                _ => {}
+            }
+        }
+        if !parts.is_empty() {
+            return parts;
+        }
+    }
+
+    let mut parts = Vec::new();
+
+    if !resp.content.is_empty() {
+        parts.push(serde_json::json!({"text": resp.content}));
+    }
+
+    for tc in &resp.tool_calls {
+        let args: Value =
+            serde_json::from_str(&tc.arguments).unwrap_or(Value::Object(Default::default()));
+        parts.push(serde_json::json!({
+            "functionCall": {"name": tc.name, "args": args}
+        }));
+    }
+
+    parts
+}
+
+fn is_plain_text_part(part: &Value) -> bool {
+    part.as_object()
+        .is_some_and(|obj| obj.len() == 1 && obj.get("text").is_some_and(Value::is_string))
+}
+
+fn is_plain_function_call_part(part: &Value) -> bool {
+    part.as_object()
+        .is_some_and(|obj| obj.len() == 1 && obj.contains_key("functionCall"))
+}
+
+fn preserve_google_response_metadata(resp: &mut AiResponse, raw: &Value) {
+    let mut metadata = serde_json::Map::new();
+    if let Some(obj) = raw.as_object() {
+        for (key, value) in obj {
+            if key != "candidates" {
+                metadata.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    if let Some(candidate) = raw
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(Value::as_object)
+    {
+        let mut candidate_extra = serde_json::Map::new();
+        for (key, value) in candidate {
+            if key != "content" && key != "finishReason" {
+                candidate_extra.insert(key.clone(), value.clone());
+            }
+        }
+        if !candidate_extra.is_empty() {
+            metadata.insert(
+                "__candidate_extra".to_string(),
+                Value::Object(candidate_extra),
+            );
+        }
+
+        if let Some(content) = candidate.get("content").and_then(Value::as_object) {
+            let mut content_extra = serde_json::Map::new();
+            for (key, value) in content {
+                if key != "role" && key != "parts" {
+                    content_extra.insert(key.clone(), value.clone());
+                }
+            }
+            if !content_extra.is_empty() {
+                metadata.insert("__content_extra".to_string(), Value::Object(content_extra));
+            }
+        }
+    }
+
+    if !metadata.is_empty() {
+        resp.vendor.ingress.insert(
+            "__google_response_metadata".to_string(),
+            Value::Object(metadata),
+        );
+    }
+}
+
+fn add_preserved_google_response_metadata(out: &mut Value, resp: &AiResponse) {
+    let Some(metadata) = resp
+        .vendor
+        .ingress
+        .get("__google_response_metadata")
+        .and_then(Value::as_object)
+    else {
+        if !resp.model.is_empty() {
+            out.as_object_mut()
+                .expect("Gemini response is an object")
+                .insert(
+                    "modelVersion".to_string(),
+                    Value::String(resp.model.clone()),
+                );
+        }
+        if !resp.id.is_empty() {
+            out.as_object_mut()
+                .expect("Gemini response is an object")
+                .insert("responseId".to_string(), Value::String(resp.id.clone()));
+        }
+        return;
+    };
+
+    let obj = out.as_object_mut().expect("Gemini response is an object");
+    for (key, value) in metadata {
+        if key.starts_with("__") {
+            continue;
+        }
+        if key == "usageMetadata" {
+            obj.insert(
+                "usageMetadata".to_string(),
+                merge_usage_counts(value.clone(), resp),
+            );
+        } else {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(candidate_extra) = metadata.get("__candidate_extra").and_then(Value::as_object)
+        && let Some(candidate) = out
+            .get_mut("candidates")
+            .and_then(Value::as_array_mut)
+            .and_then(|arr| arr.first_mut())
+            .and_then(Value::as_object_mut)
+    {
+        merge_json_object(candidate, candidate_extra);
+    }
+    if let Some(content_extra) = metadata.get("__content_extra").and_then(Value::as_object)
+        && let Some(content) = out
+            .get_mut("candidates")
+            .and_then(Value::as_array_mut)
+            .and_then(|arr| arr.first_mut())
+            .and_then(|candidate| candidate.get_mut("content"))
+            .and_then(Value::as_object_mut)
+    {
+        merge_json_object(content, content_extra);
+    }
+}
+
+fn google_usage_metadata(resp: &AiResponse) -> Value {
+    let preserved = resp
+        .vendor
+        .ingress
+        .get("__google_response_metadata")
+        .and_then(|m| m.get("usageMetadata"));
+    if let Some(usage) = preserved {
+        return merge_usage_counts(usage.clone(), resp);
+    }
+
+    serde_json::json!({
+        "promptTokenCount": resp.usage.prompt_tokens,
+        "candidatesTokenCount": resp.usage.completion_tokens,
+        "totalTokenCount": resp.usage.prompt_tokens + resp.usage.completion_tokens,
+    })
+}
+
+fn merge_usage_counts(mut usage: Value, resp: &AiResponse) -> Value {
+    let Some(obj) = usage.as_object_mut() else {
+        return google_usage_metadata_fallback(resp);
+    };
+    obj.entry("promptTokenCount".to_string())
+        .or_insert_with(|| serde_json::json!(resp.usage.prompt_tokens));
+    obj.entry("candidatesTokenCount".to_string())
+        .or_insert_with(|| serde_json::json!(resp.usage.completion_tokens));
+    obj.entry("totalTokenCount".to_string()).or_insert_with(|| {
+        serde_json::json!(resp.usage.prompt_tokens + resp.usage.completion_tokens)
+    });
+    usage
+}
+
+fn google_usage_metadata_fallback(resp: &AiResponse) -> Value {
+    google_usage_from_counts(&resp.usage)
+}
+
+fn google_usage_from_counts(usage: &Usage) -> Value {
+    serde_json::json!({
+        "promptTokenCount": usage.prompt_tokens,
+        "candidatesTokenCount": usage.completion_tokens,
+        "totalTokenCount": usage.prompt_tokens + usage.completion_tokens,
+    })
+}
+
+fn merge_json_object(
+    target: &mut serde_json::Map<String, Value>,
+    source: &serde_json::Map<String, Value>,
+) {
+    for (key, value) in source {
+        target.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+fn google_stream_metadata(chunk: &Value) -> Option<Value> {
+    let mut metadata = serde_json::Map::new();
+    if let Some(obj) = chunk.as_object() {
+        for (key, value) in obj {
+            if key != "candidates" {
+                metadata.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    }
+}
+
+fn add_stream_response_metadata(out: &mut Value, metadata: &serde_json::Map<String, Value>) {
+    let obj = out
+        .as_object_mut()
+        .expect("Gemini stream chunk is an object");
+    for (key, value) in metadata {
+        if key == "usageMetadata" || key == "candidates" {
+            continue;
+        }
+        obj.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+fn extract_gemini_usage(v: &Value) -> Usage {
     let usage = v
         .get("usageMetadata")
         .or_else(|| v.get("usage_metadata"))
         .or_else(|| v.get("usage"));
     let Some(u) = usage else {
-        return TokenUsage::default();
+        return Usage::default();
     };
 
     let input = first_u64(
@@ -389,7 +700,8 @@ fn extract_gemini_usage(v: &Value) -> TokenUsage {
         ],
     )
     .unwrap_or(0);
-    let output = first_u64(
+    let total = first_u64(u, &["totalTokenCount", "total_tokens"]);
+    let candidate_output = first_u64(
         u,
         &[
             "candidatesTokenCount",
@@ -397,13 +709,22 @@ fn extract_gemini_usage(v: &Value) -> TokenUsage {
             "outputTokenCount",
             "output_tokens",
         ],
+    );
+    let thoughts = first_u64(
+        u,
+        &["thoughtsTokenCount", "reasoning_tokens", "thought_tokens"],
     )
     .unwrap_or(0);
+    let output = total
+        .and_then(|total| total.checked_sub(input))
+        .or_else(|| candidate_output.map(|output| output.saturating_add(thoughts)))
+        .unwrap_or(0);
 
-    TokenUsage {
-        input_tokens: input as u32,
-        output_tokens: output as u32,
-        ..TokenUsage::default()
+    Usage {
+        prompt_tokens: input as u32,
+        completion_tokens: output as u32,
+        total_tokens: total.unwrap_or(input.saturating_add(output)) as u32,
+        ..Usage::default()
     }
 }
 
@@ -469,5 +790,262 @@ fn normalize_stringified_string_array(v: Value) -> Value {
         }
         Value::Array(arr) => Value::Array(arr),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{
+        ResponseDecoder, ResponseEncoder, StreamResponseDecoder, StreamResponseEncoder,
+    };
+
+    #[test]
+    fn parse_and_format_response_preserves_inline_data_part() {
+        let upstream = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": "iVBORw0KGgoAAAANSUhEUgA"
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 24,
+                "candidatesTokenCount": 1120,
+                "totalTokenCount": 1144
+            },
+            "modelVersion": "gemini-3.1-flash-image-preview"
+        });
+
+        let parsed = GoogleResponseParser.parse_response(upstream).unwrap();
+        let formatted = GoogleResponseFormatter.format_response(&parsed);
+
+        assert_eq!(
+            formatted["candidates"][0]["content"]["parts"][0]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(
+            formatted["candidates"][0]["content"]["parts"][0]["inlineData"]["data"],
+            "iVBORw0KGgoAAAANSUhEUgA"
+        );
+        assert_eq!(formatted["usageMetadata"]["promptTokenCount"], 24);
+        assert_eq!(formatted["usageMetadata"]["candidatesTokenCount"], 1120);
+    }
+
+    #[test]
+    fn parse_and_format_response_preserves_future_parts_and_metadata() {
+        let upstream = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "futureContentField": {"keep": true},
+                    "parts": [
+                        {"text": "hello", "futureTextField": 7},
+                        {"futurePart": {"foo": "bar"}}
+                    ]
+                },
+                "finishReason": "STOP",
+                "futureCandidateField": {"rank": 1}
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 24,
+                "candidatesTokenCount": 1120,
+                "totalTokenCount": 1144,
+                "trafficType": "ON_DEMAND",
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 24}],
+                "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}]
+            },
+            "modelVersion": "gemini-3.1-flash-image-preview",
+            "responseId": "resp-future",
+            "futureTopLevelField": {"trace": "abc"}
+        });
+
+        let parsed = GoogleResponseParser.parse_response(upstream).unwrap();
+        let formatted = GoogleResponseFormatter.format_response(&parsed);
+
+        assert_eq!(
+            formatted["candidates"][0]["content"]["parts"][0]["futureTextField"],
+            7
+        );
+        assert_eq!(
+            formatted["candidates"][0]["content"]["parts"][1]["futurePart"]["foo"],
+            "bar"
+        );
+        assert_eq!(
+            formatted["candidates"][0]["content"]["futureContentField"]["keep"],
+            true
+        );
+        assert_eq!(
+            formatted["candidates"][0]["futureCandidateField"]["rank"],
+            1
+        );
+        assert_eq!(formatted["futureTopLevelField"]["trace"], "abc");
+        assert_eq!(formatted["usageMetadata"]["trafficType"], "ON_DEMAND");
+        assert_eq!(
+            formatted["usageMetadata"]["candidatesTokensDetails"][0]["modality"],
+            "IMAGE"
+        );
+    }
+
+    #[test]
+    fn stream_parser_and_formatter_preserve_inline_data_part() {
+        let raw = concat!(
+            "data: {",
+            "\"candidates\":[{",
+            "\"content\":{\"role\":\"model\",\"parts\":[{",
+            "\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAABY+yvQxDX\"}",
+            "}]},",
+            "\"finishReason\":\"STOP\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":24,\"candidatesTokenCount\":1120,\"totalTokenCount\":1144},",
+            "\"modelVersion\":\"gemini-3.1-flash-image-preview\"",
+            "}\n\n"
+        );
+
+        let mut parser = GoogleStreamParser::new();
+        let deltas = parser.parse_chunk(raw).unwrap();
+        let mut formatter = GoogleStreamFormatter::new();
+        let events = formatter.format_deltas(&deltas);
+
+        let image_event = events
+            .iter()
+            .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
+            .find(|value| {
+                value["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part.get("inlineData").is_some()))
+            })
+            .expect("expected an SSE event containing the inlineData part");
+
+        assert_eq!(
+            image_event["candidates"][0]["content"]["parts"][0]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(
+            image_event["candidates"][0]["content"]["parts"][0]["inlineData"]["data"],
+            "iVBORw0KGgoAAAANSUhEUgAABY+yvQxDX"
+        );
+
+        let usage_event = events
+            .iter()
+            .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
+            .find(|value| value.get("usageMetadata").is_some())
+            .expect("expected terminal usage event");
+        assert_eq!(usage_event["usageMetadata"]["promptTokenCount"], 24);
+        assert_eq!(usage_event["usageMetadata"]["candidatesTokenCount"], 1120);
+    }
+
+    #[test]
+    fn stream_parser_and_formatter_preserve_future_part_and_usage_details() {
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"futurePart": {"foo": "bar"}}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 24,
+                "candidatesTokenCount": 1120,
+                "totalTokenCount": 1144,
+                "trafficType": "ON_DEMAND",
+                "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}]
+            },
+            "modelVersion": "gemini-3.1-flash-image-preview",
+            "responseId": "stream-future"
+        });
+        let raw = format!("data: {chunk}\n\n");
+
+        let mut parser = GoogleStreamParser::new();
+        let deltas = parser.parse_chunk(&raw).unwrap();
+        let mut formatter = GoogleStreamFormatter::new();
+        let events = formatter.format_deltas(&deltas);
+
+        let future_part_event = events
+            .iter()
+            .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
+            .find(|value| {
+                value["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part.get("futurePart").is_some()))
+            })
+            .expect("expected an SSE event containing the future part");
+        assert_eq!(
+            future_part_event["candidates"][0]["content"]["parts"][0]["futurePart"]["foo"],
+            "bar"
+        );
+
+        let usage_event = events
+            .iter()
+            .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
+            .find(|value| value.get("usageMetadata").is_some())
+            .expect("expected terminal usage event");
+        assert_eq!(usage_event["usageMetadata"]["trafficType"], "ON_DEMAND");
+        assert_eq!(
+            usage_event["usageMetadata"]["candidatesTokensDetails"][0]["modality"],
+            "IMAGE"
+        );
+        assert_eq!(usage_event["responseId"], "stream-future");
+    }
+
+    #[test]
+    fn stream_parser_extracts_usage_from_non_sse_generate_content_response() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "{\n \"\n}",
+                        "thoughtSignature": "EtpxCtdxAQtnKrzuYidcoegpuXXkuA=="
+                    }],
+                    "role": "model"
+                },
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "modelVersion": "gemini-3.5-flash",
+            "responseId": "Q90OarbFKsXM-sAPuOH-8AE",
+            "usageMetadata": {
+                "candidatesTokenCount": 1408,
+                "promptTokenCount": 10996,
+                "promptTokensDetails": [{
+                    "modality": "TEXT",
+                    "tokenCount": 10996
+                }],
+                "serviceTier": "standard",
+                "thoughtsTokenCount": 4649,
+                "totalTokenCount": 17053
+            }
+        })
+        .to_string();
+
+        let mut parser = GoogleStreamParser::new();
+        let initial = parser.parse_chunk(&raw).unwrap();
+        assert!(
+            initial.is_empty(),
+            "bare JSON should be completed by finish"
+        );
+
+        let deltas = parser.finish().unwrap();
+        let usage = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                AiStreamDelta::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("non-SSE streamGenerateContent response should emit usage");
+
+        assert_eq!(usage.prompt_tokens, 10996);
+        assert_eq!(usage.completion_tokens, 6057);
+        assert_eq!(usage.total_tokens, 17053);
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            AiStreamDelta::Done { stop_reason } if stop_reason == "stop"
+        )));
     }
 }

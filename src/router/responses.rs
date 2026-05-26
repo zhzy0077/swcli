@@ -1,4 +1,5 @@
 use super::debug::DebugDump;
+use crate::provider::{WireProtocol, github_copilot};
 use anyhow::{Context, Result, anyhow};
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
@@ -9,22 +10,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use crate::protocol::codec::anthropic_messages::{
-    encoder::AnthropicEncoder,
-    stream::{AnthropicResponseParser, AnthropicStreamParser},
+use crate::protocol::ids::{
+    ANTHROPIC_MESSAGES_2023_06_01, OPENAI_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1,
+    ProtocolEndpoint,
 };
-use crate::protocol::codec::openai_compatible::{
-    encoder::OpenAIEncoder,
-    stream::{OpenAIResponseParser, OpenAIStreamParser},
-};
-use crate::protocol::codec::openai_responses::{
-    decoder::ResponsesDecoder, formatter::ResponsesResponseFormatter,
-    stream::ResponsesStreamFormatter,
-};
-use crate::protocol::types::{InternalRequest, InternalResponse, Role, StreamDelta};
-use crate::protocol::{
-    EgressEncoder, IngressDecoder, ResponseFormatter, ResponseParser, StreamFormatter, StreamParser,
-};
+use crate::protocol::ir::{AiRequest, AiResponse, AiStreamDelta, ReasoningEffort, Role};
+use crate::protocol::{self as nyro_protocol, StreamResponseDecoder};
 
 const CODEX_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. You collaborate with the user on software engineering tasks. Use the provided tools when needed, keep changes scoped, and communicate clearly.";
 const THINKING_SIGNATURE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -118,17 +109,24 @@ pub struct RouterModelMetadata {
 #[derive(Clone)]
 struct RouterState {
     target_base_url: String,
-    api_key: String,
+    auth: RouterAuth,
     model: Option<RouterModelMetadata>,
-    target_wire: RouterTargetWire,
+    target_protocol: ProtocolEndpoint,
     client: reqwest::Client,
     thinking_signature_cache: ThinkingSignatureCache,
+    copilot_token_cache: github_copilot::CopilotTokenCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RouterTargetWire {
-    OpenaiCompletions,
-    AnthropicMessages,
+enum ProtocolMode {
+    Native,
+    Transform,
+}
+
+#[derive(Clone)]
+enum RouterAuth {
+    Bearer(String),
+    GithubCopilot { refresh_token: String },
 }
 
 pub async fn start_anthropic_responses_router(
@@ -138,9 +136,9 @@ pub async fn start_anthropic_responses_router(
 ) -> Result<RouterHandle> {
     start_responses_router(
         target_base_url,
-        api_key,
+        RouterAuth::Bearer(api_key),
         model,
-        RouterTargetWire::AnthropicMessages,
+        ANTHROPIC_MESSAGES_2023_06_01,
     )
     .await
 }
@@ -152,28 +150,58 @@ pub async fn start_openai_chat_responses_router(
 ) -> Result<RouterHandle> {
     start_responses_router(
         target_base_url,
-        api_key,
+        RouterAuth::Bearer(api_key),
         model,
-        RouterTargetWire::OpenaiCompletions,
+        OPENAI_CHAT_COMPLETIONS_V1,
+    )
+    .await
+}
+
+pub async fn start_github_copilot_codex_router(
+    target_base_url: String,
+    refresh_token: String,
+    target_wire: WireProtocol,
+    model: Option<RouterModelMetadata>,
+) -> Result<RouterHandle> {
+    start_responses_router(
+        target_base_url,
+        RouterAuth::GithubCopilot { refresh_token },
+        model,
+        router_target_wire(target_wire)?,
+    )
+    .await
+}
+
+pub async fn start_github_copilot_anthropic_messages_router(
+    target_base_url: String,
+    refresh_token: String,
+    model: Option<RouterModelMetadata>,
+) -> Result<RouterHandle> {
+    start_responses_router(
+        target_base_url,
+        RouterAuth::GithubCopilot { refresh_token },
+        model,
+        ANTHROPIC_MESSAGES_2023_06_01,
     )
     .await
 }
 
 async fn start_responses_router(
     target_base_url: String,
-    api_key: String,
+    auth: RouterAuth,
     model: Option<RouterModelMetadata>,
-    target_wire: RouterTargetWire,
+    target_protocol: ProtocolEndpoint,
 ) -> Result<RouterHandle> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     let state = Arc::new(RouterState {
         target_base_url,
-        api_key,
+        auth,
         model,
-        target_wire,
+        target_protocol,
         client: reqwest::Client::new(),
         thinking_signature_cache: ThinkingSignatureCache::new(THINKING_SIGNATURE_CACHE_TTL),
+        copilot_token_cache: github_copilot::CopilotTokenCache::new(),
     });
 
     let task = tokio::spawn(async move {
@@ -200,8 +228,8 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<RouterState>) -> Re
         Ok(RouterResponse::Buffered(bytes)) => stream.write_all(&bytes).await?,
         Ok(RouterResponse::ResponsesStream {
             upstream,
-            target_wire,
-            original_model,
+            ingress_protocol,
+            target_protocol,
             debug,
         }) => {
             stream
@@ -209,8 +237,8 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<RouterState>) -> Re
                 .await?;
             if let Err(err) = stream_target_to_responses(
                 upstream,
-                target_wire,
-                &original_model,
+                ingress_protocol,
+                target_protocol,
                 &debug,
                 &state.thinking_signature_cache,
                 &mut stream,
@@ -220,6 +248,20 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<RouterState>) -> Re
                 if !is_broken_pipe(&err) {
                     return Err(err);
                 }
+            }
+        }
+        Ok(RouterResponse::NativeStream {
+            upstream,
+            content_type,
+            debug,
+        }) => {
+            stream
+                .write_all(&http_chunked_head(200, &content_type))
+                .await?;
+            if let Err(err) = stream_upstream_passthrough(upstream, &debug, &mut stream).await
+                && !is_broken_pipe(&err)
+            {
+                return Err(err);
             }
         }
         Err(err) => {
@@ -245,17 +287,27 @@ fn is_broken_pipe(err: &anyhow::Error) -> bool {
 
 enum RouterResponse {
     Buffered(Vec<u8>),
+    NativeStream {
+        upstream: reqwest::Response,
+        content_type: String,
+        debug: DebugDump,
+    },
     ResponsesStream {
         upstream: reqwest::Response,
-        target_wire: RouterTargetWire,
-        original_model: String,
+        ingress_protocol: ProtocolEndpoint,
+        target_protocol: ProtocolEndpoint,
         debug: DebugDump,
     },
 }
 
 async fn route_request(request: &HttpRequest, state: &RouterState) -> Result<RouterResponse> {
     match request.path.as_str() {
-        "/responses" | "/v1/responses" => handle_responses(request, state).await,
+        "/responses" | "/v1/responses" => {
+            handle_protocol_request(request, state, OPENAI_RESPONSES_V1).await
+        }
+        "/messages" | "/v1/messages" => {
+            handle_protocol_request(request, state, ANTHROPIC_MESSAGES_2023_06_01).await
+        }
         "/models" | "/v1/models" => Ok(RouterResponse::Buffered(http_json(
             200,
             &codex_models_response(state.model.as_ref()),
@@ -267,9 +319,13 @@ async fn route_request(request: &HttpRequest, state: &RouterState) -> Result<Rou
     }
 }
 
-async fn handle_responses(request: &HttpRequest, state: &RouterState) -> Result<RouterResponse> {
-    let body: Value = serde_json::from_slice(&request.body).context("Invalid Responses JSON")?;
-    let debug = DebugDump::start("responses").await;
+async fn handle_protocol_request(
+    request: &HttpRequest,
+    state: &RouterState,
+    ingress_protocol: ProtocolEndpoint,
+) -> Result<RouterResponse> {
+    let body: Value = serde_json::from_slice(&request.body).context("Invalid request JSON")?;
+    let debug = DebugDump::start(debug_name(ingress_protocol)).await;
     debug
         .text(
             "00-client-request.http",
@@ -278,25 +334,16 @@ async fn handle_responses(request: &HttpRequest, state: &RouterState) -> Result<
         .await;
     debug.json("01-request-before-convert", &body).await;
 
-    let stream = body
-        .get("stream")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let original_model = body
-        .get("model")
-        .and_then(|value| value.as_str())
-        .unwrap_or_else(|| {
-            state
-                .model
-                .as_ref()
-                .map(|model| model.id.as_str())
-                .unwrap_or("model")
-        })
-        .to_string();
+    let decoded = decode_ingress_request(ingress_protocol, &body)?;
+    let stream = decoded.stream.enabled;
+    let original_model = decoded.model.clone();
+    let mode = protocol_mode(ingress_protocol, state.target_protocol);
 
-    let (upstream_request, upstream_headers, upstream_path) = encode_responses_for_target(
+    let (upstream_request, upstream_headers, upstream_path) = encode_request_for_target(
         body,
-        state.target_wire,
+        decoded,
+        ingress_protocol,
+        state.target_protocol,
         state.model.as_ref(),
         Some(&state.thinking_signature_cache),
     )?;
@@ -337,15 +384,24 @@ async fn handle_responses(request: &HttpRequest, state: &RouterState) -> Result<
         )));
     }
 
-    if stream && response_content_type(&upstream).contains("text/event-stream") {
+    let content_type = response_content_type(&upstream);
+    if stream && content_type.contains("text/event-stream") {
+        if mode == ProtocolMode::Native {
+            return Ok(RouterResponse::NativeStream {
+                upstream,
+                content_type,
+                debug,
+            });
+        }
         return Ok(RouterResponse::ResponsesStream {
             upstream,
-            target_wire: state.target_wire,
-            original_model,
+            ingress_protocol,
+            target_protocol: state.target_protocol,
             debug,
         });
     }
 
+    let status = upstream.status().as_u16();
     let status_line = upstream_status_line(&upstream);
     let headers = format_response_headers(upstream.headers());
     let upstream_text = upstream.text().await?;
@@ -358,20 +414,34 @@ async fn handle_responses(request: &HttpRequest, state: &RouterState) -> Result<
             ),
         )
         .await;
+    if mode == ProtocolMode::Native {
+        debug
+            .text("04-response-after-convert", &upstream_text)
+            .await;
+        return Ok(RouterResponse::Buffered(http_text(
+            status,
+            &content_type,
+            upstream_text,
+        )));
+    }
     let upstream_response: Value = serde_json::from_str(&upstream_text)?;
     debug
         .json("03-response-before-convert-upstream", &upstream_response)
         .await;
-    let response = parse_target_response(upstream_response, state.target_wire, &original_model)?;
+    let response =
+        parse_target_response(upstream_response, state.target_protocol, &original_model)?;
     cache_response_thinking_signature(
         &state.thinking_signature_cache,
-        state.target_wire,
+        state.target_protocol,
         &response,
     );
-    let responses_body = ResponsesResponseFormatter.format_response(&response);
+    let response_body = nyro_protocol::format_response(ingress_protocol, &response);
 
     if stream {
-        let sse = events_to_sse(ResponsesStreamFormatter::format_response(&response));
+        let sse = events_to_sse(nyro_protocol::format_response_stream(
+            ingress_protocol,
+            &response,
+        ));
         debug.text("04-response-after-convert.sse", &sse).await;
         Ok(RouterResponse::Buffered(http_text(
             200,
@@ -380,42 +450,157 @@ async fn handle_responses(request: &HttpRequest, state: &RouterState) -> Result<
         )))
     } else {
         debug
-            .json("04-response-after-convert", &responses_body)
+            .json("04-response-after-convert", &response_body)
             .await;
-        Ok(RouterResponse::Buffered(http_json(200, &responses_body)))
+        Ok(RouterResponse::Buffered(http_json(200, &response_body)))
     }
 }
 
-fn encode_responses_for_target(
+fn encode_request_for_target(
     body: Value,
-    target_wire: RouterTargetWire,
+    mut request: AiRequest,
+    ingress_protocol: ProtocolEndpoint,
+    target_protocol: ProtocolEndpoint,
     model: Option<&RouterModelMetadata>,
     thinking_signature_cache: Option<&ThinkingSignatureCache>,
 ) -> Result<(Value, HeaderMap, String)> {
-    let mut request = ResponsesDecoder.decode_request(body)?;
+    if protocol_mode(ingress_protocol, target_protocol) == ProtocolMode::Native {
+        let mut body = body;
+        let model_id = model
+            .map(|model| model.id.as_str())
+            .unwrap_or(request.model.as_str());
+        set_body_model(&mut body, model_id);
+        return Ok((
+            body,
+            native_headers(target_protocol),
+            target_path(target_protocol, request.stream.enabled),
+        ));
+    }
+
     if let Some(model) = model {
         request.model = model.id.clone();
     }
-    if target_wire == RouterTargetWire::AnthropicMessages
+    if ingress_protocol == OPENAI_RESPONSES_V1 && target_protocol == OPENAI_CHAT_COMPLETIONS_V1 {
+        mirror_responses_assistant_text_as_reasoning(&mut request);
+    }
+    if target_protocol == ANTHROPIC_MESSAGES_2023_06_01
         && let Some(cache) = thinking_signature_cache
     {
         restore_cached_thinking_signatures(&mut request, cache);
     }
+    if ingress_protocol == OPENAI_RESPONSES_V1 && target_protocol == ANTHROPIC_MESSAGES_2023_06_01 {
+        sanitize_responses_reasoning_for_anthropic(&mut request);
+    }
 
-    match target_wire {
-        RouterTargetWire::AnthropicMessages => {
-            let encoder = AnthropicEncoder;
-            let path = encoder.egress_path(&request.model, request.stream);
-            let (body, headers) = encoder.encode_request(&request)?;
-            Ok((body, headers, path))
+    let (mut encoded, headers, path) = nyro_protocol::encode_request(target_protocol, &request)?;
+    if ingress_protocol == OPENAI_RESPONSES_V1 && target_protocol == ANTHROPIC_MESSAGES_2023_06_01 {
+        apply_anthropic_reasoning_config(&request, &mut encoded);
+    }
+    Ok((encoded, headers, path))
+}
+
+#[cfg(test)]
+fn encode_responses_for_target(
+    body: Value,
+    target_protocol: ProtocolEndpoint,
+    model: Option<&RouterModelMetadata>,
+    thinking_signature_cache: Option<&ThinkingSignatureCache>,
+) -> Result<(Value, HeaderMap, String)> {
+    let request = decode_ingress_request(OPENAI_RESPONSES_V1, &body)?;
+    encode_request_for_target(
+        body,
+        request,
+        OPENAI_RESPONSES_V1,
+        target_protocol,
+        model,
+        thinking_signature_cache,
+    )
+}
+
+fn protocol_mode(
+    ingress_protocol: ProtocolEndpoint,
+    target_protocol: ProtocolEndpoint,
+) -> ProtocolMode {
+    if ingress_protocol == target_protocol {
+        ProtocolMode::Native
+    } else {
+        ProtocolMode::Transform
+    }
+}
+
+fn set_body_model(body: &mut Value, model: &str) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
+}
+
+fn target_path(target_protocol: ProtocolEndpoint, stream: bool) -> String {
+    nyro_protocol::endpoint_path(target_protocol, stream)
+}
+
+fn native_headers(target_protocol: ProtocolEndpoint) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if target_protocol == ANTHROPIC_MESSAGES_2023_06_01 {
+        headers.insert(
+            "anthropic-version",
+            reqwest::header::HeaderValue::from_static("2023-06-01"),
+        );
+    }
+    headers
+}
+
+fn decode_ingress_request(protocol: ProtocolEndpoint, body: &Value) -> Result<AiRequest> {
+    let decode_body = if protocol == OPENAI_RESPONSES_V1 {
+        normalize_responses_body_for_nyro_decode(body)
+    } else {
+        body.clone()
+    };
+    nyro_protocol::decode_request(protocol, decode_body)
+}
+
+fn normalize_responses_body_for_nyro_decode(body: &Value) -> Value {
+    let mut normalized = body.clone();
+    let Some(items) = normalized
+        .get_mut("input")
+        .and_then(|input| input.as_array_mut())
+    else {
+        return normalized;
+    };
+
+    for item in items {
+        if let Some(text) = item.as_str().map(str::to_string) {
+            *item = json!({
+                "type": "message",
+                "role": "user",
+                "content": text,
+            });
+            continue;
         }
-        RouterTargetWire::OpenaiCompletions => {
-            let encoder = OpenAIEncoder;
-            let path = encoder.egress_path(&request.model, request.stream);
-            let (body, headers) = encoder.encode_request(&request)?;
-            Ok((body, headers, path))
+
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(|value| value.as_str()).is_none() {
+            obj.insert("type".to_string(), json!("message"));
+        }
+        if obj.get("type").and_then(|value| value.as_str()) != Some("message") {
+            continue;
+        }
+        let Some(content) = obj.get_mut("content") else {
+            continue;
+        };
+        if let Some(content_obj) = content.as_object() {
+            let text = content_obj
+                .get("text")
+                .and_then(|value| value.as_str())
+                .or_else(|| content_obj.get("content").and_then(|value| value.as_str()));
+            if let Some(text) = text {
+                *content = Value::String(text.to_string());
+            }
         }
     }
+
+    normalized
 }
 
 async fn post_target(
@@ -425,69 +610,257 @@ async fn post_target(
     headers: &HeaderMap,
 ) -> Result<reqwest::Response> {
     let url = endpoint_url(&state.target_base_url, path);
-    let mut request = state
-        .client
-        .post(url)
-        .bearer_auth(&state.api_key)
-        .json(body);
+    let mut request = state.client.post(url).json(body);
+    match &state.auth {
+        RouterAuth::Bearer(api_key) => {
+            request = request.bearer_auth(api_key);
+        }
+        RouterAuth::GithubCopilot { refresh_token } => {
+            let session = state
+                .copilot_token_cache
+                .resolve_session(refresh_token, Some(&state.target_base_url), None)
+                .await
+                .context("GitHub Copilot auth resolution failed")?;
+            for (name, value) in
+                github_copilot::conversation_headers(&session.access_token, Some(body))
+            {
+                request = request.header(name, value);
+            }
+        }
+    }
     for (name, value) in headers {
         request = request.header(name, value);
+    }
+    if state.target_protocol == ANTHROPIC_MESSAGES_2023_06_01 {
+        request = request.header("anthropic-version", "2023-06-01");
     }
     request.send().await.context("target request failed")
 }
 
 fn parse_target_response(
     body: Value,
-    target_wire: RouterTargetWire,
+    target_protocol: ProtocolEndpoint,
     original_model: &str,
-) -> Result<InternalResponse> {
-    let mut response = match target_wire {
-        RouterTargetWire::AnthropicMessages => AnthropicResponseParser.parse_response(body)?,
-        RouterTargetWire::OpenaiCompletions => OpenAIResponseParser.parse_response(body)?,
+) -> Result<AiResponse> {
+    let body = if target_protocol == OPENAI_CHAT_COMPLETIONS_V1 {
+        normalize_openai_chat_response_for_nyro_parse(body)
+    } else {
+        body
     };
+    let mut response = nyro_protocol::parse_response(target_protocol, body)?;
     if response.model.is_empty() {
         response.model = original_model.to_string();
     }
     Ok(response)
 }
 
-fn restore_cached_thinking_signatures(
-    request: &mut InternalRequest,
-    cache: &ThinkingSignatureCache,
-) {
+fn normalize_openai_chat_response_for_nyro_parse(mut body: Value) -> Value {
+    let Some(choices) = body
+        .get_mut("choices")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return body;
+    };
+    for choice in choices {
+        let Some(content) = choice
+            .get_mut("message")
+            .and_then(|message| message.get_mut("content"))
+        else {
+            continue;
+        };
+        if !content.is_string() {
+            *content = Value::String(openai_chat_content_text(content));
+        }
+    }
+    body
+}
+
+fn openai_chat_content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part.as_str() {
+                    return Some(text.to_string());
+                }
+                part.get("text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| part.get("content").and_then(|value| value.as_str()))
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(obj) => obj
+            .get("text")
+            .and_then(|value| value.as_str())
+            .or_else(|| obj.get("content").and_then(|value| value.as_str()))
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn mirror_responses_assistant_text_as_reasoning(request: &mut AiRequest) {
+    if !request.reasoning.enabled {
+        return;
+    }
+    for msg in &mut request.messages {
+        if msg.role != Role::Assistant || msg.tool_calls.is_some() {
+            continue;
+        }
+        let text = msg.content.to_text();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let extra = msg.meta.get_or_insert_with(|| json!({}));
+        let Some(extra_obj) = extra.as_object_mut() else {
+            continue;
+        };
+        extra_obj
+            .entry("reasoning_content".to_string())
+            .or_insert_with(|| Value::String(text));
+    }
+}
+
+fn sanitize_responses_reasoning_for_anthropic(request: &mut AiRequest) {
+    let attached_reasoning = request
+        .messages
+        .iter()
+        .filter(|msg| msg.role == Role::Assistant && msg.tool_calls.is_some())
+        .filter_map(message_reasoning_pair)
+        .collect::<Vec<_>>();
+
+    request.messages.retain(|msg| {
+        if msg.role != Role::Assistant
+            || msg.tool_calls.is_some()
+            || !msg.content.to_text().is_empty()
+        {
+            return true;
+        }
+        let Some(pair) = message_reasoning_pair(msg) else {
+            return true;
+        };
+        !attached_reasoning.iter().any(|seen| seen == &pair)
+    });
+
     for msg in &mut request.messages {
         if msg.role != Role::Assistant {
             continue;
         }
-        if msg
-            .extra
+        let Some(extra_obj) = msg.meta.as_mut().and_then(|meta| meta.as_object_mut()) else {
+            continue;
+        };
+        let has_signature = extra_obj
+            .get("reasoning_signature")
+            .and_then(|value| value.as_str())
+            .is_some_and(|signature| !signature.trim().is_empty());
+        if !has_signature {
+            extra_obj.remove("reasoning_content");
+        }
+    }
+}
+
+fn message_reasoning_pair(msg: &crate::protocol::ir::request::Message) -> Option<(String, String)> {
+    let obj = msg.meta.as_ref()?.as_object()?;
+    let reasoning = obj
+        .get("reasoning_content")
+        .and_then(|value| value.as_str())?
+        .to_string();
+    let signature = obj
+        .get("reasoning_signature")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((reasoning, signature))
+}
+
+fn apply_anthropic_reasoning_config(request: &AiRequest, body: &mut Value) {
+    let Some(budget_tokens) = anthropic_budget_tokens(&request.reasoning.effort) else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    let max_tokens = obj
+        .get("max_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(4096);
+    if max_tokens <= budget_tokens as u64 {
+        obj.insert(
+            "max_tokens".to_string(),
+            Value::Number(serde_json::Number::from(budget_tokens.saturating_add(1024))),
+        );
+    }
+    obj.insert(
+        "thinking".to_string(),
+        json!({
+            "type": "enabled",
+            "budget_tokens": budget_tokens,
+        }),
+    );
+    if let Some(effort) = anthropic_effort(&request.reasoning.effort) {
+        obj.insert("output_config".to_string(), json!({ "effort": effort }));
+    }
+}
+
+fn anthropic_budget_tokens(effort: &Option<ReasoningEffort>) -> Option<u32> {
+    match effort.as_ref()? {
+        ReasoningEffort::None => None,
+        ReasoningEffort::Minimal | ReasoningEffort::Low => Some(1024),
+        ReasoningEffort::Medium => Some(4096),
+        ReasoningEffort::High => Some(16384),
+        ReasoningEffort::Xhigh => Some(32000),
+        ReasoningEffort::Budget(tokens) => Some(*tokens),
+    }
+}
+
+fn anthropic_effort(effort: &Option<ReasoningEffort>) -> Option<&'static str> {
+    match effort.as_ref()? {
+        ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High => Some("high"),
+        ReasoningEffort::Xhigh | ReasoningEffort::Budget(_) => Some("max"),
+    }
+}
+
+fn restore_cached_thinking_signatures(request: &mut AiRequest, cache: &ThinkingSignatureCache) {
+    for msg in &mut request.messages {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        let extra = msg.meta.get_or_insert_with(|| json!({}));
+        let Some(extra_obj) = extra.as_object_mut() else {
+            continue;
+        };
+        if extra_obj
             .get("reasoning_signature")
             .and_then(|value| value.as_str())
             .is_some_and(|signature| !signature.trim().is_empty())
         {
             continue;
         }
-        let Some(reasoning) = msg
-            .extra
+        let Some(reasoning) = extra_obj
             .get("reasoning_content")
             .and_then(|value| value.as_str())
             .filter(|reasoning| !reasoning.trim().is_empty())
+            .map(str::to_string)
         else {
             continue;
         };
-        if let Some(signature) = cache.lookup(reasoning) {
-            msg.extra
-                .insert("reasoning_signature".to_string(), json!(signature));
+        if let Some(signature) = cache.lookup(&reasoning) {
+            extra_obj.insert("reasoning_signature".to_string(), json!(signature));
         }
     }
 }
 
 fn cache_response_thinking_signature(
     cache: &ThinkingSignatureCache,
-    target_wire: RouterTargetWire,
-    response: &InternalResponse,
+    target_protocol: ProtocolEndpoint,
+    response: &AiResponse,
 ) {
-    if target_wire != RouterTargetWire::AnthropicMessages {
+    if target_protocol != ANTHROPIC_MESSAGES_2023_06_01 {
         return;
     }
     if let (Some(reasoning), Some(signature)) = (
@@ -499,18 +872,18 @@ fn cache_response_thinking_signature(
 }
 
 fn capture_thinking_signature_from_deltas(
-    target_wire: RouterTargetWire,
-    deltas: &[StreamDelta],
+    target_protocol: ProtocolEndpoint,
+    deltas: &[AiStreamDelta],
     reasoning: &mut String,
     signature: &mut String,
 ) {
-    if target_wire != RouterTargetWire::AnthropicMessages {
+    if target_protocol != ANTHROPIC_MESSAGES_2023_06_01 {
         return;
     }
     for delta in deltas {
         match delta {
-            StreamDelta::ReasoningDelta(text) => reasoning.push_str(text),
-            StreamDelta::ReasoningSignature(text) => signature.push_str(text),
+            AiStreamDelta::ThinkingDelta(text) => reasoning.push_str(text),
+            AiStreamDelta::ThinkingSignature(text) => signature.push_str(text),
             _ => {}
         }
     }
@@ -518,19 +891,17 @@ fn capture_thinking_signature_from_deltas(
 
 async fn stream_target_to_responses(
     mut upstream: reqwest::Response,
-    target_wire: RouterTargetWire,
-    original_model: &str,
+    ingress_protocol: ProtocolEndpoint,
+    target_protocol: ProtocolEndpoint,
     debug: &DebugDump,
     thinking_signature_cache: &ThinkingSignatureCache,
     stream: &mut TcpStream,
 ) -> Result<()> {
     let upstream_status_line = upstream_status_line(&upstream);
     let upstream_headers = format_response_headers(upstream.headers());
-    let mut parser: Box<dyn StreamParser> = match target_wire {
-        RouterTargetWire::AnthropicMessages => Box::new(AnthropicStreamParser::new()),
-        RouterTargetWire::OpenaiCompletions => Box::new(OpenAIStreamParser::new()),
-    };
-    let mut formatter = ResponsesStreamFormatter::new();
+    let mut parser: Box<dyn StreamResponseDecoder> =
+        nyro_protocol::stream_response_decoder(target_protocol);
+    let mut formatter = nyro_protocol::stream_response_encoder(ingress_protocol);
     let mut debug_sse = String::new();
     let mut upstream_sse = String::new();
     let mut captured_reasoning = String::new();
@@ -541,7 +912,7 @@ async fn stream_target_to_responses(
         upstream_sse.push_str(&text);
         let deltas = parser.parse_chunk(&text)?;
         capture_thinking_signature_from_deltas(
-            target_wire,
+            target_protocol,
             &deltas,
             &mut captured_reasoning,
             &mut captured_signature,
@@ -552,7 +923,7 @@ async fn stream_target_to_responses(
 
     let deltas = parser.finish()?;
     capture_thinking_signature_from_deltas(
-        target_wire,
+        target_protocol,
         &deltas,
         &mut captured_reasoning,
         &mut captured_signature,
@@ -580,7 +951,39 @@ async fn stream_target_to_responses(
     debug
         .text("04-response-after-convert.sse", &debug_sse)
         .await;
-    let _ = original_model;
+    stream.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+async fn stream_upstream_passthrough(
+    mut upstream: reqwest::Response,
+    debug: &DebugDump,
+    stream: &mut TcpStream,
+) -> Result<()> {
+    let upstream_status_line = upstream_status_line(&upstream);
+    let upstream_headers = format_response_headers(upstream.headers());
+    let mut upstream_body = Vec::new();
+
+    while let Some(chunk) = upstream.chunk().await? {
+        upstream_body.extend_from_slice(&chunk);
+        write_chunk(stream, &chunk).await?;
+    }
+
+    debug
+        .text(
+            "03-response-before-convert-upstream.http",
+            &format_http_message(
+                &format!("{upstream_status_line}\r\n{upstream_headers}"),
+                &upstream_body,
+            ),
+        )
+        .await;
+    debug
+        .text(
+            "04-response-after-convert.passthrough",
+            &String::from_utf8_lossy(&upstream_body),
+        )
+        .await;
     stream.write_all(b"0\r\n\r\n").await?;
     Ok(())
 }
@@ -876,6 +1279,24 @@ fn response_content_type(response: &reqwest::Response) -> String {
         .to_ascii_lowercase()
 }
 
+fn router_target_wire(wire: WireProtocol) -> Result<ProtocolEndpoint> {
+    match wire {
+        WireProtocol::OpenaiResponses => Ok(OPENAI_RESPONSES_V1),
+        WireProtocol::OpenaiCompletions => Ok(OPENAI_CHAT_COMPLETIONS_V1),
+        WireProtocol::AnthropicMessages => Ok(ANTHROPIC_MESSAGES_2023_06_01),
+    }
+}
+
+fn debug_name(ingress_protocol: ProtocolEndpoint) -> &'static str {
+    if ingress_protocol == OPENAI_RESPONSES_V1 {
+        "responses"
+    } else if ingress_protocol == ANTHROPIC_MESSAGES_2023_06_01 {
+        "messages"
+    } else {
+        "protocol"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,7 +1343,7 @@ mod tests {
                 "max_output_tokens": 1024,
                 "reasoning": {"effort": "high"}
             }),
-            RouterTargetWire::AnthropicMessages,
+            ANTHROPIC_MESSAGES_2023_06_01,
             Some(&model()),
             None,
         )
@@ -949,7 +1370,7 @@ mod tests {
                 "stream": true,
                 "reasoning": {"effort": "high"}
             }),
-            RouterTargetWire::OpenaiCompletions,
+            OPENAI_CHAT_COMPLETIONS_V1,
             Some(&model()),
             None,
         )
@@ -961,6 +1382,65 @@ mod tests {
         assert_eq!(request["stream_options"]["include_usage"], true);
         assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["messages"][0]["reasoning_content"], "prior");
+    }
+
+    #[test]
+    fn native_responses_passthrough_preserves_body_and_overrides_model() {
+        let body = json!({
+            "model": "codex-model",
+            "input": "hello",
+            "stream": true,
+            "metadata": {"keep": true}
+        });
+        let decoded = nyro_protocol::decode_request(OPENAI_RESPONSES_V1, body.clone()).unwrap();
+        let (request, headers, path) = encode_request_for_target(
+            body,
+            decoded,
+            OPENAI_RESPONSES_V1,
+            OPENAI_RESPONSES_V1,
+            Some(&model()),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(path, "/v1/responses");
+        assert!(headers.is_empty());
+        assert_eq!(request["model"], "actual-model");
+        assert_eq!(request["input"], "hello");
+        assert_eq!(request["metadata"], json!({"keep": true}));
+        assert_eq!(request["stream"], true);
+    }
+
+    #[test]
+    fn native_anthropic_passthrough_preserves_body_and_version_header() {
+        let body = json!({
+            "model": "claude-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+            "stream": true
+        });
+        let decoded =
+            nyro_protocol::decode_request(ANTHROPIC_MESSAGES_2023_06_01, body.clone()).unwrap();
+        let (request, headers, path) = encode_request_for_target(
+            body,
+            decoded,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            Some(&model()),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(path, "/v1/messages");
+        assert_eq!(request["model"], "actual-model");
+        assert_eq!(request["messages"][0]["content"], "hello");
+        assert_eq!(request["max_tokens"], 1024);
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
     }
 
     #[test]
@@ -977,7 +1457,7 @@ mod tests {
                 "stream": true,
                 "reasoning": {"effort": "medium"}
             }),
-            RouterTargetWire::AnthropicMessages,
+            ANTHROPIC_MESSAGES_2023_06_01,
             Some(&model()),
             None,
         )
@@ -1014,7 +1494,7 @@ mod tests {
                 "stream": true,
                 "reasoning": {"effort": "medium"}
             }),
-            RouterTargetWire::AnthropicMessages,
+            ANTHROPIC_MESSAGES_2023_06_01,
             Some(&model()),
             Some(&cache),
         )
@@ -1039,7 +1519,7 @@ mod tests {
                     {"type": "message", "role": "user", "content": {"text": "object content"}}
                 ]
             }),
-            RouterTargetWire::OpenaiCompletions,
+            OPENAI_CHAT_COMPLETIONS_V1,
             Some(&model()),
             None,
         )
@@ -1063,11 +1543,11 @@ mod tests {
                 "usage": {"input_tokens": 3, "output_tokens": 4},
                 "stop_reason": "tool_use"
             }),
-            RouterTargetWire::AnthropicMessages,
+            ANTHROPIC_MESSAGES_2023_06_01,
             "fallback-model",
         )
         .unwrap();
-        let body = ResponsesResponseFormatter.format_response(&response);
+        let body = nyro_protocol::format_response(OPENAI_RESPONSES_V1, &response);
 
         assert_eq!(body["model"], "upstream-model");
         assert_eq!(body["output"][0]["type"], "reasoning");
@@ -1090,29 +1570,25 @@ mod tests {
                     "finish_reason": "stop"
                 }]
             }),
-            RouterTargetWire::OpenaiCompletions,
+            OPENAI_CHAT_COMPLETIONS_V1,
             "fallback-model",
         )
         .unwrap();
-        let body = ResponsesResponseFormatter.format_response(&response);
+        let body = nyro_protocol::format_response(OPENAI_RESPONSES_V1, &response);
 
         assert_eq!(body["output"][0]["content"][0]["text"], "hello\n world");
     }
 
     #[test]
     fn buffered_stream_fallback_uses_responses_stream_formatter() {
-        let response = InternalResponse {
-            id: "resp_1".to_string(),
-            model: "model".to_string(),
-            content: "hello".to_string(),
-            reasoning_content: Some("think".to_string()),
-            reasoning_signature: None,
-            tool_calls: vec![],
-            response_items: None,
-            stop_reason: Some("stop".to_string()),
-            usage: Default::default(),
-        };
-        let sse = events_to_sse(ResponsesStreamFormatter::format_response(&response));
+        let mut response = AiResponse::new("resp_1", "model");
+        response.content = "hello".to_string();
+        response.reasoning_content = Some("think".to_string());
+        response.stop_reason = Some("stop".to_string());
+        let sse = events_to_sse(nyro_protocol::format_response_stream(
+            OPENAI_RESPONSES_V1,
+            &response,
+        ));
 
         assert!(sse.contains("response.reasoning_summary_text.delta"));
         assert!(sse.contains("response.output_text.delta"));

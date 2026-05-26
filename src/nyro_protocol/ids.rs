@@ -121,11 +121,15 @@ impl fmt::Display for ProtocolEndpoint {
 pub const OPENAI_CHAT_COMPLETIONS_V1: ProtocolEndpoint =
     ProtocolEndpoint::new(Protocol::OpenAICompatible, "chat-completions", "v1");
 
+pub const OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1: ProtocolEndpoint = OPENAI_CHAT_COMPLETIONS_V1;
+
 #[deprecated(since = "0.1.0", note = "use `OPENAI_CHAT_COMPLETIONS_V1` instead")]
 pub const OPENAI_CHAT_V1: ProtocolEndpoint = OPENAI_CHAT_COMPLETIONS_V1;
 
 pub const OPENAI_EMBEDDINGS_V1: ProtocolEndpoint =
     ProtocolEndpoint::new(Protocol::OpenAICompatible, "embeddings", "v1");
+
+pub const OPENAI_COMPATIBLE_EMBEDDINGS_V1: ProtocolEndpoint = OPENAI_EMBEDDINGS_V1;
 
 pub const OPENAI_RESPONSES_V1: ProtocolEndpoint =
     ProtocolEndpoint::new(Protocol::OpenAIResponses, "responses", "v1");
@@ -135,6 +139,8 @@ pub const ANTHROPIC_MESSAGES_2023_06_01: ProtocolEndpoint =
 
 pub const GOOGLE_GENERATE_CONTENT_V1BETA: ProtocolEndpoint =
     ProtocolEndpoint::new(Protocol::GoogleGenerativeAI, "generate-content", "v1beta");
+
+pub const GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA: ProtocolEndpoint = GOOGLE_GENERATE_CONTENT_V1BETA;
 
 #[deprecated(since = "0.1.0", note = "use `GOOGLE_GENERATE_CONTENT_V1BETA` instead")]
 pub const GOOGLE_GENERATE_V1BETA: ProtocolEndpoint = GOOGLE_GENERATE_CONTENT_V1BETA;

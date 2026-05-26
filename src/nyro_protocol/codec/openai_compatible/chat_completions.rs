@@ -1,13 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 //! OpenAI Chat Completions API (`POST /v1/chat/completions`).
 //!
 //! `EndpointHandler` registration shell — wraps
 //! [`super::decoder`], [`super::encoder`], and [`super::stream`] codecs.
 
-use crate::protocol::ids::{EndpointCapabilities, OPENAI_CHAT_COMPLETIONS_V1, ProtocolEndpoint};
+use crate::protocol::ids::{
+    EndpointCapabilities, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, ProtocolEndpoint,
+};
 use crate::protocol::registry::EndpointRegistration;
 use crate::protocol::traits::*;
 
@@ -26,27 +24,27 @@ const CAPS: EndpointCapabilities = EndpointCapabilities {
 
 impl EndpointHandler for OpenAIChatCompletionsV1 {
     fn id(&self) -> ProtocolEndpoint {
-        OPENAI_CHAT_COMPLETIONS_V1
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
     }
     fn capabilities(&self) -> &'static EndpointCapabilities {
         &CAPS
     }
-    fn make_decoder(&self) -> Box<dyn IngressDecoder + Send> {
+    fn make_request_decoder(&self) -> Box<dyn RequestDecoder + Send> {
         Box::new(super::decoder::OpenAIDecoder)
     }
-    fn make_encoder(&self) -> Box<dyn EgressEncoder + Send> {
+    fn make_request_encoder(&self) -> Box<dyn RequestEncoder + Send> {
         Box::new(super::encoder::OpenAIEncoder)
     }
-    fn make_response_parser(&self) -> Box<dyn ResponseParser> {
+    fn make_response_decoder(&self) -> Box<dyn ResponseDecoder> {
         Box::new(super::stream::OpenAIResponseParser)
     }
-    fn make_response_formatter(&self) -> Box<dyn ResponseFormatter> {
+    fn make_response_encoder(&self) -> Box<dyn ResponseEncoder> {
         Box::new(super::stream::OpenAIResponseFormatter)
     }
-    fn make_stream_parser(&self) -> Box<dyn StreamParser> {
+    fn make_stream_response_decoder(&self) -> Box<dyn StreamResponseDecoder> {
         Box::new(super::stream::OpenAIStreamParser::new())
     }
-    fn make_stream_formatter(&self) -> Box<dyn StreamFormatter> {
+    fn make_stream_response_encoder(&self) -> Box<dyn StreamResponseEncoder> {
         Box::new(super::stream::OpenAIStreamFormatter::new())
     }
 }

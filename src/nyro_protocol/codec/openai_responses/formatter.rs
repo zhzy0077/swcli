@@ -1,17 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::protocol::ResponseFormatter;
-use crate::protocol::types::{InternalResponse, ResponseItem, TokenUsage};
+use crate::protocol::ResponseEncoder;
+use crate::protocol::ir::AiResponse;
+use crate::protocol::ir::response::ResponseItem;
 
 pub struct ResponsesResponseFormatter;
 
-impl ResponseFormatter for ResponsesResponseFormatter {
-    fn format_response(&self, resp: &InternalResponse) -> Value {
+impl ResponseEncoder for ResponsesResponseFormatter {
+    fn format_response(&self, resp: &AiResponse) -> Value {
         let resp_id = if resp.id.is_empty() {
             format!("resp_{}", Uuid::new_v4().simple())
         } else {
@@ -22,10 +19,10 @@ impl ResponseFormatter for ResponsesResponseFormatter {
         let mut output: Vec<Value> = Vec::new();
         let mut output_text = String::new();
 
-        if let Some(items) = &resp.response_items {
+        if let Some(items) = &resp.items {
             for item in items {
                 match item {
-                    ResponseItem::Reasoning { text } => {
+                    ResponseItem::Thinking { text } => {
                         output.push(serde_json::json!({
                             "type": "reasoning",
                             "id": format!("rs_{}", Uuid::new_v4().simple()),
@@ -49,9 +46,10 @@ impl ResponseFormatter for ResponsesResponseFormatter {
                             "status": "completed"
                         }));
                     }
-                    ResponseItem::Message { text } => {
+                    ResponseItem::OutputText { text } => {
                         output_text.push_str(text);
                     }
+                    _ => {}
                 }
             }
         } else {
@@ -99,47 +97,11 @@ impl ResponseFormatter for ResponsesResponseFormatter {
             "model": resp.model,
             "output": output,
             "output_text": output_text,
-            "usage": responses_usage_json(&resp.usage)
+            "usage": {
+                "input_tokens": resp.usage.prompt_tokens,
+                "output_tokens": resp.usage.completion_tokens,
+                "total_tokens": resp.usage.prompt_tokens + resp.usage.completion_tokens
+            }
         })
     }
-}
-
-fn responses_usage_json(usage: &TokenUsage) -> Value {
-    let mut value = serde_json::json!({
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "total_tokens": usage.input_tokens + usage.output_tokens,
-    });
-
-    if let Some(obj) = value.as_object_mut() {
-        if usage.cache_read_input_tokens.is_some() || usage.cache_creation_input_tokens.is_some() {
-            obj.insert(
-                "input_tokens_details".to_string(),
-                serde_json::json!({
-                    "cached_tokens": usage.cache_read_input_tokens.unwrap_or(0),
-                    "cache_creation_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
-                }),
-            );
-        }
-        if let Some(v) = usage.cache_read_input_tokens {
-            obj.insert("cache_read_input_tokens".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = usage.cache_creation_input_tokens {
-            obj.insert(
-                "cache_creation_input_tokens".to_string(),
-                serde_json::json!(v),
-            );
-        }
-        if let Some(server_tool_use) = &usage.server_tool_use {
-            obj.insert(
-                "server_tool_use".to_string(),
-                serde_json::json!({
-                    "web_search_requests": server_tool_use.web_search_requests,
-                    "web_fetch_requests": server_tool_use.web_fetch_requests,
-                }),
-            );
-        }
-    }
-
-    value
 }

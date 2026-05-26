@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 //! OpenAI Responses API egress encoder (PR-09).
 //!
 //! PR-09 adds forwarding for:
@@ -17,8 +13,9 @@ use anyhow::Result;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
-use crate::protocol::EgressEncoder;
-use crate::protocol::types::*;
+use crate::protocol::RequestEncoder;
+use crate::protocol::ir::AiRequest;
+use crate::protocol::ir::request::{Role, ToolChoice};
 
 /// Encoder for the OpenAI Responses API (`POST /v1/responses`).
 ///
@@ -29,21 +26,23 @@ pub struct ResponsesEncoder;
 // Fields that must NOT be copied blindly from extra into the egress body.
 const SKIP_FROM_EXTRA: &[&str] = &["messages", "input", "instructions", "stream", "model"];
 
-impl EgressEncoder for ResponsesEncoder {
-    fn encode_request(&self, req: &InternalRequest) -> Result<(Value, HeaderMap)> {
+impl RequestEncoder for ResponsesEncoder {
+    fn encode_request(&self, req: &AiRequest) -> Result<(Value, HeaderMap)> {
+        let ingress = &req.meta.vendor.ingress;
+
         let mut instructions: Vec<String> = Vec::new();
         let mut input: Vec<Value> = Vec::new();
 
         for message in &req.messages {
             match message.role {
                 Role::System => {
-                    let text = message.content.as_text();
+                    let text = message.content.to_text();
                     if !text.is_empty() {
                         instructions.push(text);
                     }
                 }
                 Role::User | Role::Assistant => {
-                    let text = message.content.as_text();
+                    let text = message.content.to_text();
                     if !text.is_empty() {
                         let role_str = match message.role {
                             Role::User => "user",
@@ -75,7 +74,7 @@ impl EgressEncoder for ResponsesEncoder {
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": message.tool_call_id.clone().unwrap_or_default(),
-                        "output": message.content.as_text(),
+                        "output": message.content.to_text(),
                     }));
                 }
             }
@@ -92,8 +91,7 @@ impl EgressEncoder for ResponsesEncoder {
         };
 
         // Determine `store` — default false unless the request explicitly set it.
-        let store = req
-            .extra
+        let store = ingress
             .get("store")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
@@ -107,23 +105,19 @@ impl EgressEncoder for ResponsesEncoder {
         });
         let obj = body.as_object_mut().unwrap();
 
-        if let Some(t) = req.temperature {
+        if let Some(t) = req.generation.temperature {
             obj.insert("temperature".into(), t.into());
         }
-        if let Some(p) = req.top_p {
+        if let Some(p) = req.generation.top_p {
             obj.insert("top_p".into(), p.into());
         }
-        // max_tokens is intentionally NOT forwarded as max_output_tokens here.
-        // The Codex backend rejects this field; callers that need a token cap
-        // must set it explicitly via req.extra["max_output_tokens"].
 
         // ── Tools (function + built-in) ───────────────────────────────────────
         if let Some(ref tools) = req.tools {
             let tools_val: Vec<Value> = tools
                 .iter()
                 .map(|t| {
-                    if let Some(_builtin_type) = t.name.strip_prefix("__builtin__") {
-                        // Reconstruct built-in tool from the raw parameters blob.
+                    if t.name.starts_with("__builtin__") {
                         t.parameters.clone()
                     } else {
                         serde_json::json!({
@@ -138,10 +132,9 @@ impl EgressEncoder for ResponsesEncoder {
             obj.insert("tools".into(), Value::Array(tools_val));
         }
         if let Some(ref tc) = req.tool_choice {
-            obj.insert("tool_choice".into(), tc.clone());
+            obj.insert("tool_choice".into(), tool_choice_to_value(tc));
         }
 
-        // ── PR-09 named extra fields ──────────────────────────────────────────
         for key in &[
             "background",
             "previous_response_id",
@@ -154,13 +147,13 @@ impl EgressEncoder for ResponsesEncoder {
             "service_tier",
             "user",
         ] {
-            if let Some(v) = req.extra.get(*key) {
+            if let Some(v) = ingress.get(*key) {
                 obj.entry(key.to_string()).or_insert_with(|| v.clone());
             }
         }
 
         // Passthrough remaining unknown extra fields.
-        for (k, v) in &req.extra {
+        for (k, v) in ingress {
             if SKIP_FROM_EXTRA.contains(&k.as_str()) {
                 continue;
             }
@@ -172,5 +165,18 @@ impl EgressEncoder for ResponsesEncoder {
 
     fn egress_path(&self, _model: &str, _stream: bool) -> String {
         "/v1/responses".to_string()
+    }
+}
+
+fn tool_choice_to_value(tc: &ToolChoice) -> Value {
+    match tc {
+        ToolChoice::Auto => Value::String("auto".into()),
+        ToolChoice::None => Value::String("none".into()),
+        ToolChoice::Required => Value::String("required".into()),
+        ToolChoice::Named { name } => serde_json::json!({
+            "type": "function",
+            "function": {"name": name}
+        }),
+        ToolChoice::Raw(v) => v.clone(),
     }
 }

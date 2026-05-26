@@ -3,17 +3,22 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const API_VERSION: &str = "2025-05-01";
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const OAUTH_SCOPES: &str = "read:user";
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const COPILOT_TOKEN_MAX_TTL: Duration = Duration::from_secs(5 * 60);
+const COPILOT_TOKEN_SAFETY_MARGIN: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct GithubCopilotSession {
     pub base_url: String,
     pub access_token: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +36,71 @@ pub struct GithubCopilotModel {
 struct TokenResponse {
     token: String,
     #[serde(rename = "expires_at")]
-    _expires_at: i64,
+    expires_at: i64,
+}
+
+#[derive(Clone, Default)]
+pub struct CopilotTokenCache {
+    entries: Arc<Mutex<Vec<CopilotTokenEntry>>>,
+}
+
+#[derive(Clone)]
+struct CopilotTokenEntry {
+    refresh_token: String,
+    base_url: String,
+    access_token: String,
+    expires_at: i64,
+    inserted_at: Instant,
+}
+
+impl CopilotTokenCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn resolve_session(
+        &self,
+        refresh_token: &str,
+        base_url: Option<&str>,
+        enterprise_url: Option<&str>,
+    ) -> Result<GithubCopilotSession> {
+        let domain = normalize_domain(enterprise_url.unwrap_or("github.com"));
+        let base_url = base_url
+            .map(str::to_string)
+            .unwrap_or_else(|| "https://api.githubcopilot.com".to_string());
+        let now = Instant::now();
+        let now_unix = unix_now();
+
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.retain(|entry| token_entry_valid(entry, now, now_unix));
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.refresh_token == refresh_token && entry.base_url == base_url)
+            {
+                return Ok(GithubCopilotSession {
+                    base_url,
+                    access_token: entry.access_token.clone(),
+                    expires_at: entry.expires_at,
+                });
+            }
+        }
+
+        let session = exchange_copilot_token(refresh_token, &base_url, Some(&domain)).await?;
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.retain(|entry| {
+                token_entry_valid(entry, Instant::now(), unix_now())
+                    && !(entry.refresh_token == refresh_token && entry.base_url == base_url)
+            });
+            entries.push(CopilotTokenEntry {
+                refresh_token: refresh_token.to_string(),
+                base_url,
+                access_token: session.access_token.clone(),
+                expires_at: session.expires_at,
+                inserted_at: Instant::now(),
+            });
+        }
+        Ok(session)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,7 +385,21 @@ async fn exchange_copilot_token(
     Ok(GithubCopilotSession {
         base_url: base_url.to_string(),
         access_token: parsed.token,
+        expires_at: parsed.expires_at,
     })
+}
+
+fn token_entry_valid(entry: &CopilotTokenEntry, now: Instant, now_unix: i64) -> bool {
+    now.duration_since(entry.inserted_at)
+        < COPILOT_TOKEN_MAX_TTL.saturating_sub(COPILOT_TOKEN_SAFETY_MARGIN)
+        && entry.expires_at > now_unix + COPILOT_TOKEN_SAFETY_MARGIN.as_secs() as i64
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn is_picker_model(model: &LiveModel) -> bool {
@@ -626,5 +709,27 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.interval, 5);
+    }
+
+    #[test]
+    fn copilot_token_cache_validity_obeys_ttl_and_expiry_margin() {
+        let now = Instant::now();
+        let now_unix = unix_now();
+        let valid = CopilotTokenEntry {
+            refresh_token: "refresh".to_string(),
+            base_url: "https://api.githubcopilot.com".to_string(),
+            access_token: "access".to_string(),
+            expires_at: now_unix + 600,
+            inserted_at: now,
+        };
+        assert!(token_entry_valid(&valid, now, now_unix));
+
+        let mut old = valid.clone();
+        old.inserted_at = now - Duration::from_secs(5 * 60);
+        assert!(!token_entry_valid(&old, now, now_unix));
+
+        let mut nearly_expired = valid;
+        nearly_expired.expires_at = now_unix + 10;
+        assert!(!token_entry_valid(&nearly_expired, now, now_unix));
     }
 }

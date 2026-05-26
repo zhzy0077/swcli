@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 //! Raw request envelope — a snapshot of the original bytes / headers.
 //!
 //! Preserved for:

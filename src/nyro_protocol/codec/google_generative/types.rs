@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

@@ -1,17 +1,15 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::protocol::types::*;
-use crate::protocol::{ResponseParser, StreamParser};
+use crate::protocol::ir::request::ToolCall;
+use crate::protocol::ir::usage::Usage;
+use crate::protocol::ir::{AiResponse, AiStreamDelta};
+use crate::protocol::{ResponseDecoder, StreamResponseDecoder};
 
 pub struct ResponsesResponseParser;
 
-impl ResponseParser for ResponsesResponseParser {
-    fn parse_response(&self, resp: Value) -> Result<InternalResponse> {
+impl ResponseDecoder for ResponsesResponseParser {
+    fn parse_response(&self, resp: Value) -> Result<AiResponse> {
         let id = resp
             .get("id")
             .and_then(|v| v.as_str())
@@ -76,31 +74,26 @@ impl ResponseParser for ResponsesResponseParser {
             }
         }
 
-        let usage = TokenUsage {
-            input_tokens: resp
+        let usage = Usage {
+            prompt_tokens: resp
                 .get("usage")
                 .and_then(|v| v.get("input_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
-            output_tokens: resp
+            completion_tokens: resp
                 .get("usage")
                 .and_then(|v| v.get("output_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
-            ..TokenUsage::default()
+            ..Usage::default()
         };
 
-        Ok(InternalResponse {
-            id,
-            model,
-            content,
-            reasoning_content: None,
-            reasoning_signature: None,
-            tool_calls,
-            response_items: None,
-            stop_reason,
-            usage,
-        })
+        let mut ai_resp = AiResponse::new(id, model);
+        ai_resp.content = content;
+        ai_resp.tool_calls = tool_calls;
+        ai_resp.stop_reason = stop_reason;
+        ai_resp.usage = usage;
+        Ok(ai_resp)
     }
 }
 
@@ -124,8 +117,8 @@ impl ResponsesStreamParser {
     }
 }
 
-impl StreamParser for ResponsesStreamParser {
-    fn parse_chunk(&mut self, raw: &str) -> Result<Vec<StreamDelta>> {
+impl StreamResponseDecoder for ResponsesStreamParser {
+    fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
         self.buffer.push_str(raw);
         let mut deltas = Vec::new();
 
@@ -144,7 +137,7 @@ impl StreamParser for ResponsesStreamParser {
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
-                    deltas.push(StreamDelta::Done {
+                    deltas.push(AiStreamDelta::Done {
                         stop_reason: "stop".to_string(),
                     });
                     continue;
@@ -159,7 +152,7 @@ impl StreamParser for ResponsesStreamParser {
         Ok(deltas)
     }
 
-    fn finish(&mut self) -> Result<Vec<StreamDelta>> {
+    fn finish(&mut self) -> Result<Vec<AiStreamDelta>> {
         if self.buffer.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -169,7 +162,12 @@ impl StreamParser for ResponsesStreamParser {
 }
 
 impl ResponsesStreamParser {
-    fn parse_event(&mut self, event: Option<&str>, payload: &Value, deltas: &mut Vec<StreamDelta>) {
+    fn parse_event(
+        &mut self,
+        event: Option<&str>,
+        payload: &Value,
+        deltas: &mut Vec<AiStreamDelta>,
+    ) {
         match event.unwrap_or("") {
             "response.created" | "response.in_progress" => {
                 if self.started {
@@ -188,14 +186,14 @@ impl ResponsesStreamParser {
                     .to_string();
                 if !id.is_empty() || !model.is_empty() {
                     self.started = true;
-                    deltas.push(StreamDelta::MessageStart { id, model });
+                    deltas.push(AiStreamDelta::MessageStart { id, model });
                 }
             }
             "response.output_text.delta" => {
                 if let Some(text) = payload.get("delta").and_then(|v| v.as_str())
                     && !text.is_empty()
                 {
-                    deltas.push(StreamDelta::TextDelta(text.to_string()));
+                    deltas.push(AiStreamDelta::TextDelta(text.to_string()));
                 }
             }
             "response.reasoning_summary_text.delta" => {
@@ -205,7 +203,7 @@ impl ResponsesStreamParser {
                 if let Some(text) = payload.get("delta").and_then(|v| v.as_str())
                     && !text.is_empty()
                 {
-                    deltas.push(StreamDelta::ReasoningDelta(text.to_string()));
+                    deltas.push(AiStreamDelta::ThinkingDelta(text.to_string()));
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -216,7 +214,7 @@ impl ResponsesStreamParser {
                 if let Some(arguments) = payload.get("delta").and_then(|v| v.as_str())
                     && !arguments.is_empty()
                 {
-                    deltas.push(StreamDelta::ToolCallDelta {
+                    deltas.push(AiStreamDelta::ToolCallDelta {
                         index,
                         arguments: arguments.to_string(),
                     });
@@ -241,29 +239,29 @@ impl ResponsesStreamParser {
                         .unwrap_or("")
                         .to_string();
                     if !id.is_empty() && !name.is_empty() {
-                        deltas.push(StreamDelta::ToolCallStart { index, id, name });
+                        deltas.push(AiStreamDelta::ToolCallStart { index, id, name });
                     }
                 }
             }
             "response.completed" => {
                 let response = payload.get("response").unwrap_or(payload);
-                let usage = TokenUsage {
-                    input_tokens: response
+                let usage = Usage {
+                    prompt_tokens: response
                         .get("usage")
                         .and_then(|v| v.get("input_tokens"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32,
-                    output_tokens: response
+                    completion_tokens: response
                         .get("usage")
                         .and_then(|v| v.get("output_tokens"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32,
-                    ..TokenUsage::default()
+                    ..Usage::default()
                 };
-                if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                    deltas.push(StreamDelta::Usage(usage));
+                if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
+                    deltas.push(AiStreamDelta::Usage(usage));
                 }
-                deltas.push(StreamDelta::Done {
+                deltas.push(AiStreamDelta::Done {
                     stop_reason: response
                         .get("status")
                         .and_then(|v| v.as_str())
@@ -279,7 +277,8 @@ impl ResponsesStreamParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ResponseParser, StreamParser};
+    use crate::protocol::ir::AiStreamDelta;
+    use crate::protocol::{ResponseDecoder, StreamResponseDecoder};
 
     fn sse_event(event: &str, data: &str) -> String {
         format!("event: {event}\ndata: {data}\n\n")
@@ -311,7 +310,7 @@ mod tests {
         let r = ResponsesResponseParser.parse_response(resp).unwrap();
         assert_eq!(r.content, "hello");
         assert_eq!(r.stop_reason.as_deref(), Some("completed"));
-        assert_eq!(r.usage.input_tokens, 5);
+        assert_eq!(r.usage.prompt_tokens, 5);
     }
 
     #[test]
@@ -397,8 +396,10 @@ mod tests {
 
         let has_text = deltas
             .iter()
-            .any(|d| matches!(d, StreamDelta::TextDelta(t) if t == "hello"));
-        let has_done = deltas.iter().any(|d| matches!(d, StreamDelta::Done { .. }));
+            .any(|d| matches!(d, AiStreamDelta::TextDelta(t) if t == "hello"));
+        let has_done = deltas
+            .iter()
+            .any(|d| matches!(d, AiStreamDelta::Done { .. }));
         assert!(has_text, "expected TextDelta('hello'), got: {deltas:?}");
         assert!(has_done, "expected Done, got: {deltas:?}");
     }
@@ -433,7 +434,7 @@ mod tests {
         let reasoning: Vec<_> = deltas
             .iter()
             .filter_map(|d| {
-                if let StreamDelta::ReasoningDelta(t) = d {
+                if let AiStreamDelta::ThinkingDelta(t) = d {
                     Some(t.as_str())
                 } else {
                     None
@@ -442,13 +443,13 @@ mod tests {
             .collect();
         assert!(
             reasoning.contains(&"thinking step"),
-            "response.reasoning_summary_text.delta must produce ReasoningDelta, got: {deltas:?}"
+            "response.reasoning_summary_text.delta must produce ThinkingDelta, got: {deltas:?}"
         );
 
         let text: Vec<_> = deltas
             .iter()
             .filter_map(|d| {
-                if let StreamDelta::TextDelta(t) = d {
+                if let AiStreamDelta::TextDelta(t) = d {
                     Some(t.as_str())
                 } else {
                     None
@@ -466,7 +467,9 @@ mod tests {
         let sse = sse_data("[DONE]");
         let mut parser = ResponsesStreamParser::new();
         let deltas = parser.parse_chunk(&sse).unwrap();
-        let has_done = deltas.iter().any(|d| matches!(d, StreamDelta::Done { .. }));
+        let has_done = deltas
+            .iter()
+            .any(|d| matches!(d, AiStreamDelta::Done { .. }));
         assert!(
             has_done,
             "expected Done on [DONE] sentinel, got: {deltas:?}"

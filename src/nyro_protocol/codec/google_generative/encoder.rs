@@ -1,27 +1,26 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 use anyhow::Result;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
-use crate::protocol::EgressEncoder;
-use crate::protocol::types::*;
+use crate::protocol::RequestEncoder;
+use crate::protocol::ir::AiRequest;
+use crate::protocol::ir::request::{ContentBlock, MediaSource, Message, MessageContent, Role};
 
 pub struct GoogleEncoder;
 
-impl EgressEncoder for GoogleEncoder {
-    fn encode_request(&self, req: &InternalRequest) -> Result<(Value, HeaderMap)> {
+impl RequestEncoder for GoogleEncoder {
+    fn encode_request(&self, req: &AiRequest) -> Result<(Value, HeaderMap)> {
+        let ingress = &req.meta.vendor.ingress;
+
         // ── System instruction ────────────────────────────────────────────────
         let system_val: Option<Value> =
-            if let Some(v) = req.extra.get("__google_raw_system_instruction") {
+            if let Some(v) = ingress.get("__google_raw_system_instruction") {
                 Some(v.clone())
             } else {
                 let mut system_parts: Vec<Value> = Vec::new();
                 for msg in &req.messages {
                     if msg.role == Role::System {
-                        system_parts.push(serde_json::json!({"text": msg.content.as_text()}));
+                        system_parts.push(serde_json::json!({"text": msg.content.to_text()}));
                     }
                 }
                 if system_parts.is_empty() {
@@ -48,22 +47,20 @@ impl EgressEncoder for GoogleEncoder {
         }
 
         // ── generationConfig ──────────────────────────────────────────────────
-        // Start from extra (full preserved config) and layer InternalRequest
-        // overrides on top so model-override and routing changes still apply.
         let mut gen_config: serde_json::Map<String, Value> =
-            if let Some(Value::Object(m)) = req.extra.get("__google_generation_config") {
+            if let Some(Value::Object(m)) = ingress.get("__google_generation_config") {
                 m.clone()
             } else {
                 serde_json::Map::new()
             };
 
-        if let Some(t) = req.temperature {
+        if let Some(t) = req.generation.temperature {
             gen_config.insert("temperature".into(), t.into());
         }
-        if let Some(m) = req.max_tokens {
+        if let Some(m) = req.generation.max_tokens {
             gen_config.insert("maxOutputTokens".into(), m.into());
         }
-        if let Some(p) = req.top_p {
+        if let Some(p) = req.generation.top_p {
             gen_config.insert("topP".into(), p.into());
         }
 
@@ -72,8 +69,7 @@ impl EgressEncoder for GoogleEncoder {
         }
 
         // ── Tools ─────────────────────────────────────────────────────────────
-        // Prefer raw tools (preserves built-ins) if present.
-        if let Some(raw) = req.extra.get("__google_raw_tools") {
+        if let Some(raw) = ingress.get("__google_raw_tools") {
             obj.insert("tools".into(), raw.clone());
         } else if let Some(ref tools) = req.tools {
             let mut fn_decls: Vec<Value> = Vec::new();
@@ -113,14 +109,14 @@ impl EgressEncoder for GoogleEncoder {
             }
         }
 
-        // ── PR-11 extra passthrough fields ────────────────────────────────────
-        if let Some(v) = req.extra.get("__google_tool_config") {
+        // ── Extra passthrough fields ───────────────────────────────────────────
+        if let Some(v) = ingress.get("__google_tool_config") {
             obj.insert("toolConfig".into(), v.clone());
         }
-        if let Some(v) = req.extra.get("__google_safety_settings") {
+        if let Some(v) = ingress.get("__google_safety_settings") {
             obj.insert("safetySettings".into(), v.clone());
         }
-        if let Some(v) = req.extra.get("__google_cached_content") {
+        if let Some(v) = ingress.get("__google_cached_content") {
             obj.insert("cachedContent".into(), v.clone());
         }
 
@@ -160,7 +156,7 @@ fn sanitize_gemini_schema(value: &Value) -> Value {
 
 // ── Content encoding ──────────────────────────────────────────────────────────
 
-fn encode_content(msg: &InternalMessage) -> Result<Value> {
+fn encode_content(msg: &Message) -> Result<Value> {
     let role = match msg.role {
         Role::User | Role::Tool => "user",
         Role::Assistant => "model",
@@ -194,33 +190,42 @@ fn encode_content(msg: &InternalMessage) -> Result<Value> {
         }
         MessageContent::Blocks(blocks) => blocks
             .iter()
-            .map(|b| match b {
-                ContentBlock::Text { text } => serde_json::json!({"text": text}),
-                ContentBlock::Image { source } => {
-                    serde_json::json!({
-                        "inlineData": {
-                            "mimeType": source.media_type,
-                            "data": source.data,
-                        }
-                    })
-                }
-                ContentBlock::ToolUse { id: _, name, input } => {
-                    serde_json::json!({"functionCall": {"name": name, "args": input}})
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                } => {
-                    serde_json::json!({
-                        "functionResponse": {"name": tool_use_id, "response": content}
-                    })
-                }
-                ContentBlock::Reasoning { text, .. } => {
-                    serde_json::json!({"text": text})
-                }
-            })
+            .map(|b| encode_content_block_for_gemini(b))
             .collect(),
     };
 
     Ok(serde_json::json!({"role": role, "parts": parts}))
+}
+
+fn encode_content_block_for_gemini(b: &ContentBlock) -> Value {
+    match b {
+        ContentBlock::Text { text, .. } => serde_json::json!({"text": text}),
+        ContentBlock::Image { source, .. } => match source {
+            MediaSource::Base64 { media_type, data } => serde_json::json!({
+                "inlineData": {
+                    "mimeType": media_type,
+                    "data": data,
+                }
+            }),
+            MediaSource::Url(url) => serde_json::json!({"fileData": {"fileUri": url}}),
+            MediaSource::FileId { file_id, .. } => {
+                serde_json::json!({"fileData": {"fileUri": file_id}})
+            }
+        },
+        ContentBlock::ToolUse { name, input, .. } => {
+            serde_json::json!({"functionCall": {"name": name, "args": input}})
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => {
+            serde_json::json!({
+                "functionResponse": {"name": tool_use_id, "response": content}
+            })
+        }
+        ContentBlock::Thinking { thinking, .. } => serde_json::json!({"text": thinking}),
+        ContentBlock::Unknown { raw } => raw.clone(),
+        other => serde_json::to_value(other).unwrap_or(Value::Null),
+    }
 }

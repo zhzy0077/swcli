@@ -1,14 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
-//! `AiResponse` — the new unified egress IR.
+//! `AiResponse` — the unified egress IR produced by all codec response parsers.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::protocol::ir::error::AiError;
+use crate::protocol::ir::usage::Usage;
 use crate::protocol::ir::vendor_ext::VendorExtensions;
-use crate::protocol::types::TokenUsage;
 
 // ── ResponseItem ──────────────────────────────────────────────────────────────
 
@@ -18,8 +15,8 @@ use crate::protocol::types::TokenUsage;
 pub enum ResponseItem {
     /// A text output block.
     OutputText { text: String },
-    /// A reasoning / thinking block.
-    Reasoning { text: String },
+    /// A thinking / reasoning block.
+    Thinking { text: String },
     /// A tool call issued by the model.
     FunctionCall {
         call_id: String,
@@ -40,27 +37,30 @@ pub enum ResponseItem {
 
 // ── AiResponse ────────────────────────────────────────────────────────────────
 
-/// Unified egress IR produced by all codec response parsers.
-#[derive(Debug, Clone)]
+/// Unified egress IR produced by all codec response parsers and the accumulator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiResponse {
     /// The unique response ID assigned by the provider.
     pub id: String,
     /// The model variant that was actually used.
     pub model: String,
-    /// The primary text content.
+    /// The primary text content (convenience field; also present in `content_blocks`).
     pub content: String,
-    /// Extended reasoning / thinking output.
+    /// Extended thinking / reasoning output (convenience field).
     pub reasoning_content: Option<String>,
-    /// Anthropic reasoning signature.
+    /// Thinking signature for multi-turn passback (Anthropic).
     pub reasoning_signature: Option<String>,
-    /// Tool calls issued by the model.
+    /// Tool calls issued by the model (convenience field; also in `content_blocks`).
     pub tool_calls: Vec<crate::protocol::ir::request::ToolCall>,
     /// Item graph (native for OpenAI Responses; synthesized for other protocols).
     pub items: Option<Vec<ResponseItem>>,
     /// Stop reason (e.g. `"stop"`, `"tool_use"`, `"length"`).
     pub stop_reason: Option<String>,
     /// Token usage.
-    pub usage: TokenUsage,
+    pub usage: Usage,
+    /// Normalized error — populated when the provider returns an error response
+    /// or the parser detects a mid-stream error.
+    pub error: Option<AiError>,
     /// Vendor-specific extra fields.
     pub vendor: VendorExtensions,
 }
@@ -76,8 +76,13 @@ impl AiResponse {
             tool_calls: Vec::new(),
             items: None,
             stop_reason: None,
-            usage: TokenUsage::default(),
+            usage: Usage::default(),
+            error: None,
             vendor: VendorExtensions::default(),
         }
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.error.is_some()
     }
 }

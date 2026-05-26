@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 //! Vendor extensions — three-segment model.
 //!
 //! Every `AiRequest` and `AiResponse` carries a `VendorExtensions` bag that
@@ -23,10 +19,11 @@
 //!   in PR-07) will reject requests with non-empty `passthrough_safe` entries
 //!   unless `allow_passthrough` is set on the route.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VendorExtensions {
     /// Extra fields from the ingress body (client side).
     pub ingress: HashMap<String, Value>,

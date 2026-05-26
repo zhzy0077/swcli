@@ -39,7 +39,6 @@
 //! and [`registry::ProtocolRegistry::parse_protocol`] for Protocol-level resolution.
 
 pub mod codec;
-pub mod types;
 
 pub mod ids;
 pub mod ir;
@@ -53,46 +52,44 @@ use crate::protocol::ids::{OPENAI_CHAT_COMPLETIONS_V1, ProtocolEndpoint};
 
 // ── Client → Gateway ──
 
-pub trait IngressDecoder {
-    fn decode_request(&self, body: serde_json::Value) -> anyhow::Result<types::InternalRequest>;
+pub trait RequestDecoder {
+    fn decode_request(&self, body: serde_json::Value) -> anyhow::Result<ir::AiRequest>;
 }
 
 // ── Gateway → Provider ──
 
-pub trait EgressEncoder {
-    fn encode_request(
-        &self,
-        req: &types::InternalRequest,
-    ) -> anyhow::Result<(serde_json::Value, HeaderMap)>;
+pub trait RequestEncoder {
+    fn encode_request(&self, req: &ir::AiRequest)
+    -> anyhow::Result<(serde_json::Value, HeaderMap)>;
 
     fn egress_path(&self, model: &str, stream: bool) -> String;
 }
 
 // ── Provider response → internal ──
 
-pub trait ResponseParser: Send {
-    fn parse_response(&self, resp: serde_json::Value) -> anyhow::Result<types::InternalResponse>;
+pub trait ResponseDecoder: Send {
+    fn parse_response(&self, resp: serde_json::Value) -> anyhow::Result<ir::AiResponse>;
 }
 
 // ── Internal → client response ──
 
-pub trait ResponseFormatter: Send {
-    fn format_response(&self, resp: &types::InternalResponse) -> serde_json::Value;
+pub trait ResponseEncoder: Send {
+    fn format_response(&self, resp: &ir::AiResponse) -> serde_json::Value;
 }
 
 // ── Streaming: provider → internal deltas ──
 
-pub trait StreamParser: Send {
-    fn parse_chunk(&mut self, raw: &str) -> anyhow::Result<Vec<types::StreamDelta>>;
-    fn finish(&mut self) -> anyhow::Result<Vec<types::StreamDelta>>;
+pub trait StreamResponseDecoder: Send {
+    fn parse_chunk(&mut self, raw: &str) -> anyhow::Result<Vec<ir::AiStreamDelta>>;
+    fn finish(&mut self) -> anyhow::Result<Vec<ir::AiStreamDelta>>;
 }
 
 // ── Streaming: internal deltas → client SSE ──
 
-pub trait StreamFormatter: Send {
-    fn format_deltas(&mut self, deltas: &[types::StreamDelta]) -> Vec<SseEvent>;
+pub trait StreamResponseEncoder: Send {
+    fn format_deltas(&mut self, deltas: &[ir::AiStreamDelta]) -> Vec<SseEvent>;
     fn format_done(&mut self) -> Vec<SseEvent>;
-    fn usage(&self) -> types::TokenUsage;
+    fn usage(&self) -> ir::Usage;
 }
 
 // ── SSE helper ──
@@ -119,6 +116,119 @@ impl SseEvent {
         s.push_str(&format!("data: {}\n\n", self.data));
         s
     }
+}
+
+pub fn decode_request(
+    endpoint: ProtocolEndpoint,
+    body: serde_json::Value,
+) -> anyhow::Result<ir::AiRequest> {
+    endpoint
+        .handler()
+        .make_request_decoder()
+        .decode_request(body)
+}
+
+pub fn encode_request(
+    endpoint: ProtocolEndpoint,
+    request: &ir::AiRequest,
+) -> anyhow::Result<(serde_json::Value, HeaderMap, String)> {
+    let encoder = endpoint.handler().make_request_encoder();
+    let path = encoder.egress_path(&request.model, request.stream.enabled);
+    let (body, headers) = encoder.encode_request(request)?;
+    Ok((body, headers, path))
+}
+
+pub fn endpoint_path(endpoint: ProtocolEndpoint, stream: bool) -> String {
+    endpoint
+        .handler()
+        .make_request_encoder()
+        .egress_path("", stream)
+}
+
+pub fn parse_response(
+    endpoint: ProtocolEndpoint,
+    body: serde_json::Value,
+) -> anyhow::Result<ir::AiResponse> {
+    endpoint
+        .handler()
+        .make_response_decoder()
+        .parse_response(body)
+}
+
+pub fn format_response(endpoint: ProtocolEndpoint, response: &ir::AiResponse) -> serde_json::Value {
+    endpoint
+        .handler()
+        .make_response_encoder()
+        .format_response(response)
+}
+
+pub fn stream_response_decoder(endpoint: ProtocolEndpoint) -> Box<dyn StreamResponseDecoder> {
+    endpoint.handler().make_stream_response_decoder()
+}
+
+pub fn stream_response_encoder(endpoint: ProtocolEndpoint) -> Box<dyn StreamResponseEncoder> {
+    endpoint.handler().make_stream_response_encoder()
+}
+
+pub fn format_response_stream(
+    endpoint: ProtocolEndpoint,
+    response: &ir::AiResponse,
+) -> Vec<SseEvent> {
+    let mut formatter = endpoint.handler().make_stream_response_encoder();
+    let deltas = response_to_deltas(response);
+    let mut events = formatter.format_deltas(&deltas);
+    events.extend(formatter.format_done());
+    events
+}
+
+fn response_to_deltas(response: &ir::AiResponse) -> Vec<ir::AiStreamDelta> {
+    let id = if response.id.is_empty() {
+        "resp_buffered".to_string()
+    } else {
+        response.id.clone()
+    };
+    let model = if response.model.is_empty() {
+        "model".to_string()
+    } else {
+        response.model.clone()
+    };
+    let mut deltas = vec![ir::AiStreamDelta::MessageStart { id, model }];
+
+    if let Some(reasoning) = response
+        .reasoning_content
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        deltas.push(ir::AiStreamDelta::ThinkingDelta(reasoning.to_string()));
+    }
+    if !response.content.is_empty() {
+        deltas.push(ir::AiStreamDelta::TextDelta(response.content.clone()));
+    }
+    for (index, tool_call) in response.tool_calls.iter().enumerate() {
+        deltas.push(ir::AiStreamDelta::ToolCallStart {
+            index,
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+        });
+        if !tool_call.arguments.is_empty() {
+            deltas.push(ir::AiStreamDelta::ToolCallDelta {
+                index,
+                arguments: tool_call.arguments.clone(),
+            });
+        }
+    }
+    deltas.push(ir::AiStreamDelta::Usage(response.usage.clone()));
+    deltas.push(ir::AiStreamDelta::Done {
+        stop_reason: response.stop_reason.clone().unwrap_or_else(|| {
+            if response.tool_calls.is_empty() {
+                "stop".to_string()
+            } else {
+                "tool_calls".to_string()
+            }
+        }),
+    });
+    deltas
 }
 
 // ── Provider multi-protocol negotiation ──

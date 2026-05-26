@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Adapted from Nyro: https://github.com/nyroway/nyro
-// Local modifications for swcli.
-
 //! Google Generative AI (`POST /v1beta/models/:model:generateContent`).
 //!
 //! Wire version `v1beta` matches Google's URL versioning.
@@ -10,7 +6,7 @@
 //! in the request body / URL path rather than a top-level `model` field.
 
 use crate::protocol::ids::{
-    EndpointCapabilities, GOOGLE_GENERATE_CONTENT_V1BETA, ProtocolEndpoint,
+    EndpointCapabilities, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, ProtocolEndpoint,
 };
 use crate::protocol::registry::EndpointRegistration;
 use crate::protocol::traits::*;
@@ -30,27 +26,27 @@ const CAPS: EndpointCapabilities = EndpointCapabilities {
 
 impl EndpointHandler for GoogleGenerateContentV1Beta {
     fn id(&self) -> ProtocolEndpoint {
-        GOOGLE_GENERATE_CONTENT_V1BETA
+        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA
     }
     fn capabilities(&self) -> &'static EndpointCapabilities {
         &CAPS
     }
-    fn make_decoder(&self) -> Box<dyn IngressDecoder + Send> {
+    fn make_request_decoder(&self) -> Box<dyn RequestDecoder + Send> {
         Box::new(super::decoder::GoogleDecoder)
     }
-    fn make_encoder(&self) -> Box<dyn EgressEncoder + Send> {
+    fn make_request_encoder(&self) -> Box<dyn RequestEncoder + Send> {
         Box::new(super::encoder::GoogleEncoder)
     }
-    fn make_response_parser(&self) -> Box<dyn ResponseParser> {
+    fn make_response_decoder(&self) -> Box<dyn ResponseDecoder> {
         Box::new(super::stream::GoogleResponseParser)
     }
-    fn make_response_formatter(&self) -> Box<dyn ResponseFormatter> {
+    fn make_response_encoder(&self) -> Box<dyn ResponseEncoder> {
         Box::new(super::stream::GoogleResponseFormatter)
     }
-    fn make_stream_parser(&self) -> Box<dyn StreamParser> {
+    fn make_stream_response_decoder(&self) -> Box<dyn StreamResponseDecoder> {
         Box::new(super::stream::GoogleStreamParser::new())
     }
-    fn make_stream_formatter(&self) -> Box<dyn StreamFormatter> {
+    fn make_stream_response_encoder(&self) -> Box<dyn StreamResponseEncoder> {
         Box::new(super::stream::GoogleStreamFormatter::new())
     }
 }
