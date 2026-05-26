@@ -412,19 +412,22 @@ fn encode_message(msg: &InternalMessage) -> Result<Value> {
                 .and_then(|v| v.as_str())
                 .filter(|v| !v.trim().is_empty());
 
-            if reasoning.is_some() || msg.tool_calls.is_some() {
+            // Native Anthropic thinking can only be replayed when we have
+            // the provider-issued signature.  Codex/OpenAI Responses reasoning
+            // summaries are not valid Anthropic thinking blocks: omitting the
+            // signature fails as `Field required`, while sending an empty one
+            // fails as `Invalid signature`.  Preserve signed Anthropic thinking,
+            // but do not synthesize unsigned thinking from a summary.
+            let signed_reasoning = reasoning.zip(reasoning_signature);
+
+            if signed_reasoning.is_some() || msg.tool_calls.is_some() {
                 let mut blocks: Vec<Value> = vec![];
-                if let Some(text) = reasoning {
-                    let mut block = serde_json::json!({
+                if let Some((text, signature)) = signed_reasoning {
+                    blocks.push(serde_json::json!({
                         "type": "thinking",
                         "thinking": text,
-                    });
-                    if let Some(signature) = reasoning_signature
-                        && let Some(obj) = block.as_object_mut()
-                    {
-                        obj.insert("signature".into(), serde_json::json!(signature));
-                    }
-                    blocks.push(block);
+                        "signature": signature,
+                    }));
                 }
                 if !t.is_empty() {
                     blocks.push(serde_json::json!({"type": "text", "text": t}));
@@ -464,17 +467,17 @@ fn encode_message(msg: &InternalMessage) -> Result<Value> {
                         })
                     }
                     ContentBlock::Reasoning { text, signature } => {
-                        let mut block = serde_json::json!({
-                            "type": "thinking",
-                            "thinking": text,
-                        });
                         if let Some(sig) = signature
                             && !sig.trim().is_empty()
-                            && let Some(obj) = block.as_object_mut()
                         {
-                            obj.insert("signature".into(), serde_json::json!(sig));
+                            serde_json::json!({
+                                "type": "thinking",
+                                "thinking": text,
+                                "signature": sig,
+                            })
+                        } else {
+                            serde_json::json!({"type": "text", "text": ""})
                         }
-                        block
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         serde_json::json!({

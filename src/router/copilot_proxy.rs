@@ -1,3 +1,4 @@
+use super::debug::DebugDump;
 use crate::provider::github_copilot;
 use crate::router::responses;
 use anyhow::{Context, Result, anyhow};
@@ -17,7 +18,7 @@ enum ProxyResponse {
     Stream {
         status: u16,
         content_type: String,
-        response: reqwest::Response,
+        body: String,
     },
 }
 
@@ -94,7 +95,14 @@ async fn start_proxy(
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<ProxyState>) -> Result<()> {
     let request = read_http_request(&mut stream).await?;
-    let response = route_request(&request, &state).await;
+    let debug = DebugDump::start("copilot-proxy").await;
+    debug
+        .text(
+            "00-client-request.http",
+            &format_http_message(&redact_http_head(&request.head), &request.body),
+        )
+        .await;
+    let response = route_request(&request, &state, &debug).await;
     match response {
         Ok(ProxyResponse::Buffered(response)) => {
             stream.write_all(&response).await?;
@@ -102,14 +110,12 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProxyState>) -> Res
         Ok(ProxyResponse::Stream {
             status,
             content_type,
-            mut response,
+            body,
         }) => {
             stream
                 .write_all(&http_stream_head(status, &content_type))
                 .await?;
-            while let Some(chunk) = response.chunk().await? {
-                stream.write_all(&chunk).await?;
-            }
+            stream.write_all(body.as_bytes()).await?;
         }
         Err(err) => {
             let bytes = http_json(
@@ -127,11 +133,15 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProxyState>) -> Res
     Ok(())
 }
 
-async fn route_request(request: &HttpRequest, state: &ProxyState) -> Result<ProxyResponse> {
+async fn route_request(
+    request: &HttpRequest,
+    state: &ProxyState,
+    debug: &DebugDump,
+) -> Result<ProxyResponse> {
     match state.mode {
         ProxyMode::OpenaiResponses => match request.path.as_str() {
             "/responses" | "/v1/responses" => {
-                forward_json(state, "/responses", request, false).await
+                forward_json(state, "/responses", request, false, debug).await
             }
             "/models" | "/v1/models" => Ok(ProxyResponse::Buffered(http_json(
                 200,
@@ -144,7 +154,7 @@ async fn route_request(request: &HttpRequest, state: &ProxyState) -> Result<Prox
         },
         ProxyMode::OpenaiChat => match request.path.as_str() {
             "/chat/completions" | "/v1/chat/completions" => {
-                forward_json(state, "/chat/completions", request, false).await
+                forward_json(state, "/chat/completions", request, false, debug).await
             }
             _ => Ok(ProxyResponse::Buffered(http_json(
                 404,
@@ -153,7 +163,7 @@ async fn route_request(request: &HttpRequest, state: &ProxyState) -> Result<Prox
         },
         ProxyMode::AnthropicMessages => match request.path.as_str() {
             "/messages" | "/v1/messages" => {
-                forward_json(state, "/v1/messages", request, true).await
+                forward_json(state, "/v1/messages", request, true, debug).await
             }
             _ => Ok(ProxyResponse::Buffered(http_json(
                 404,
@@ -168,6 +178,7 @@ async fn forward_json(
     upstream_path: &str,
     request: &HttpRequest,
     anthropic: bool,
+    debug: &DebugDump,
 ) -> Result<ProxyResponse> {
     let body = if request.body.is_empty() {
         None
@@ -191,6 +202,17 @@ async fn forward_json(
     if let Some(body) = &body {
         upstream = upstream.json(body);
     }
+    debug
+        .text(
+            "02-upstream-request.http",
+            &format_upstream_request_http(
+                &session.base_url,
+                upstream_path,
+                body.as_ref(),
+                anthropic,
+            ),
+        )
+        .await;
 
     let response = upstream
         .send()
@@ -203,14 +225,25 @@ async fn forward_json(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let status_line = upstream_status_line(&response);
+    let headers = format_response_headers(response.headers());
+    let body = response.text().await.unwrap_or_default();
+    debug
+        .text(
+            "03-response-before-convert-upstream.http",
+            &format_http_message(&format!("{status_line}\r\n{headers}"), body.as_bytes()),
+        )
+        .await;
     if is_event_stream(&content_type) {
+        debug
+            .text("03-response-before-convert-upstream.sse", &body)
+            .await;
         return Ok(ProxyResponse::Stream {
             status,
             content_type,
-            response,
+            body,
         });
     }
-    let body = response.text().await.unwrap_or_default();
     Ok(ProxyResponse::Buffered(http_text(
         status,
         &content_type,
@@ -230,6 +263,7 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
 
 struct HttpRequest {
     path: String,
+    head: String,
     body: Vec<u8>,
 }
 
@@ -250,7 +284,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         }
     };
 
-    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
     let path = headers
         .lines()
         .next()
@@ -271,7 +305,82 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .get(body_start..body_start + content_length)
         .unwrap_or_default()
         .to_vec();
-    Ok(HttpRequest { path, body })
+    Ok(HttpRequest {
+        path,
+        head: headers,
+        body,
+    })
+}
+
+fn format_upstream_request_http(
+    base_url: &str,
+    upstream_path: &str,
+    body: Option<&Value>,
+    anthropic: bool,
+) -> String {
+    let url = endpoint_url(base_url, upstream_path);
+    let body_bytes = body
+        .map(|body| serde_json::to_vec_pretty(body).unwrap_or_else(|_| b"{}".to_vec()))
+        .unwrap_or_default();
+    let mut head = format!("POST {url} HTTP/1.1\r\n");
+    head.push_str("authorization: <redacted>\r\n");
+    head.push_str("content-type: application/json\r\n");
+    if anthropic {
+        head.push_str("anthropic-version: 2023-06-01\r\n");
+    }
+    head.push_str(&format!("content-length: {}\r\n", body_bytes.len()));
+    format_http_message(&head, &body_bytes)
+}
+
+fn upstream_status_line(response: &reqwest::Response) -> String {
+    let status = response.status();
+    format!(
+        "HTTP/1.1 {} {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Upstream")
+    )
+}
+
+fn format_response_headers(headers: &reqwest::header::HeaderMap) -> String {
+    let mut out = String::new();
+    for (name, value) in headers {
+        if is_sensitive_header(name.as_str()) {
+            out.push_str(&format!("{}: <redacted>\r\n", name.as_str()));
+        } else if let Ok(value) = value.to_str() {
+            out.push_str(&format!("{}: {value}\r\n", name.as_str()));
+        }
+    }
+    out
+}
+
+fn format_http_message(head: &str, body: &[u8]) -> String {
+    let mut out = head.trim_end_matches("\r\n").to_string();
+    out.push_str("\r\n\r\n");
+    out.push_str(&String::from_utf8_lossy(body));
+    out
+}
+
+fn redact_http_head(head: &str) -> String {
+    head.lines()
+        .map(|line| {
+            let Some((name, _)) = line.split_once(':') else {
+                return line.to_string();
+            };
+            if is_sensitive_header(name) {
+                format!("{}: <redacted>", name.trim())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "x-api-key" | "api-key" | "anthropic-api-key" | "cookie" | "set-cookie"
+    )
 }
 
 fn content_length(headers: &str) -> Result<usize> {

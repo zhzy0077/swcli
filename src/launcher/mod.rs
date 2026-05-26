@@ -29,6 +29,8 @@ pub(crate) async fn run_tool(store: &mut Store, mut args: LaunchArgs) -> Result<
             name: model.name.clone(),
             context_window: model.context_window,
             supports_reasoning: model.supports_reasoning,
+            supports_vision: model.supports_vision,
+            supports_search: model.supports_search,
         });
     let mut command = match tool {
         Tool::Codex => Command::new("codex"),

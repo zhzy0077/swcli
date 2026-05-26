@@ -22,6 +22,8 @@ pub struct GithubCopilotModel {
     pub name: String,
     pub context_window: Option<u64>,
     pub supports_reasoning: bool,
+    pub supports_vision: bool,
+    pub supports_search: bool,
     pub wire: WireProtocol,
 }
 
@@ -84,6 +86,8 @@ struct LiveCapabilities {
 struct LiveLimits {
     #[serde(default)]
     max_context_window_tokens: Option<u64>,
+    #[serde(default)]
+    vision: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -94,6 +98,8 @@ struct LiveSupports {
     max_thinking_budget: Option<u64>,
     #[serde(default)]
     reasoning_effort: Option<Vec<String>>,
+    #[serde(default)]
+    vision: Option<bool>,
 }
 
 pub async fn resolve_session(
@@ -226,6 +232,8 @@ fn parse_models_response(body: Value) -> Result<Vec<GithubCopilotModel>> {
                     capabilities.limits.max_context_window_tokens
                 },
                 supports_reasoning: model_supports_reasoning(&capabilities),
+                supports_vision: model_supports_vision(&capabilities),
+                supports_search: supports_responses,
                 wire: if supports_messages {
                     WireProtocol::AnthropicMessages
                 } else if supports_responses {
@@ -329,6 +337,10 @@ fn model_supports_reasoning(capabilities: &LiveCapabilities) -> bool {
             .as_ref()
             .map(|values| !values.is_empty())
             .unwrap_or(false)
+}
+
+fn model_supports_vision(capabilities: &LiveCapabilities) -> bool {
+    capabilities.supports.vision == Some(true) || capabilities.limits.vision.is_some()
 }
 
 fn model_headers(access_token: &str) -> reqwest::header::HeaderMap {
@@ -562,9 +574,14 @@ mod tests {
                     "capabilities": {
                         "type": "chat",
                         "limits": {
-                            "max_context_window_tokens": 400000
+                            "max_context_window_tokens": 400000,
+                            "vision": {
+                                "max_prompt_images": 1
+                            }
                         },
-                        "supports": {}
+                        "supports": {
+                            "vision": true
+                        }
                     }
                 }
             ]
@@ -577,8 +594,12 @@ mod tests {
         assert!(models[0].supports_reasoning);
         assert_eq!(models[1].wire, WireProtocol::OpenaiCompletions);
         assert_eq!(models[1].context_window, Some(128000));
+        assert!(!models[1].supports_vision);
+        assert!(!models[1].supports_search);
         assert_eq!(models[2].wire, WireProtocol::OpenaiResponses);
         assert_eq!(models[2].context_window, Some(400000));
+        assert!(models[2].supports_vision);
+        assert!(models[2].supports_search);
     }
 
     #[test]

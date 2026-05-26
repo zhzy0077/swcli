@@ -102,6 +102,7 @@ impl IngressDecoder for ResponsesDecoder {
             }
             Value::Array(items) => {
                 let mut pending_reasoning: Option<String> = None;
+                let mut pending_reasoning_attached = false;
                 for item in items {
                     // Preserve reasoning_content from Responses API "reasoning" items.
                     // DeepSeek requires that reasoning_content be passed back on the
@@ -115,6 +116,7 @@ impl IngressDecoder for ResponsesDecoder {
                     {
                         if let Some(reasoning) = responses_item_reasoning_content(item) {
                             pending_reasoning = Some(reasoning);
+                            pending_reasoning_attached = false;
                         }
                         continue;
                     }
@@ -141,12 +143,19 @@ impl IngressDecoder for ResponsesDecoder {
                                         "reasoning_content".to_string(),
                                         Value::String(reasoning),
                                     );
+                                    pending_reasoning_attached = true;
                                 }
                             } else if msg.role == Role::User || msg.role == Role::System {
                                 // User/System messages are true conversation turn boundaries.
                                 // If pending reasoning was never attached to an assistant
-                                // message, emit it as a standalone assistant now.
-                                if let Some(reasoning) = pending_reasoning.take() {
+                                // message, emit it as a standalone assistant now.  If it was
+                                // already attached to one or more assistant function_call
+                                // messages, drop it here; otherwise the end-of-turn flush can
+                                // synthesize a trailing assistant whose only Anthropic block is
+                                // `thinking`, which Claude rejects.
+                                if let Some(reasoning) = pending_reasoning.take()
+                                    && !pending_reasoning_attached
+                                {
                                     let mut extra = HashMap::new();
                                     extra.insert(
                                         "reasoning_content".to_string(),
@@ -160,6 +169,7 @@ impl IngressDecoder for ResponsesDecoder {
                                         extra,
                                     });
                                 }
+                                pending_reasoning_attached = false;
                             }
                             // Tool outputs and other non-assistant types: leave
                             // pending_reasoning intact — they sit between calls of the
@@ -172,8 +182,14 @@ impl IngressDecoder for ResponsesDecoder {
                         }
                     }
                 }
-                // Flush any remaining pending reasoning at end of input
-                if let Some(reasoning) = pending_reasoning.take() {
+                // Flush any remaining pending reasoning at end of input only if it
+                // was never attached to an assistant item.  Codex often emits an
+                // empty assistant message after function_call; decoding that to None
+                // used to leave the pending reasoning alive and create a trailing
+                // assistant containing only `thinking` on Anthropic.
+                if let Some(reasoning) = pending_reasoning.take()
+                    && !pending_reasoning_attached
+                {
                     let mut extra = HashMap::new();
                     extra.insert("reasoning_content".to_string(), Value::String(reasoning));
                     messages.push(InternalMessage {

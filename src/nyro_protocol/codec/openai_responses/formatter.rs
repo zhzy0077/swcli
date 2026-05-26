@@ -6,7 +6,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::protocol::ResponseFormatter;
-use crate::protocol::types::{InternalResponse, ResponseItem};
+use crate::protocol::types::{InternalResponse, ResponseItem, TokenUsage};
 
 pub struct ResponsesResponseFormatter;
 
@@ -99,11 +99,47 @@ impl ResponseFormatter for ResponsesResponseFormatter {
             "model": resp.model,
             "output": output,
             "output_text": output_text,
-            "usage": {
-                "input_tokens": resp.usage.input_tokens,
-                "output_tokens": resp.usage.output_tokens,
-                "total_tokens": resp.usage.input_tokens + resp.usage.output_tokens
-            }
+            "usage": responses_usage_json(&resp.usage)
         })
     }
+}
+
+fn responses_usage_json(usage: &TokenUsage) -> Value {
+    let mut value = serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.input_tokens + usage.output_tokens,
+    });
+
+    if let Some(obj) = value.as_object_mut() {
+        if usage.cache_read_input_tokens.is_some() || usage.cache_creation_input_tokens.is_some() {
+            obj.insert(
+                "input_tokens_details".to_string(),
+                serde_json::json!({
+                    "cached_tokens": usage.cache_read_input_tokens.unwrap_or(0),
+                    "cache_creation_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
+                }),
+            );
+        }
+        if let Some(v) = usage.cache_read_input_tokens {
+            obj.insert("cache_read_input_tokens".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = usage.cache_creation_input_tokens {
+            obj.insert(
+                "cache_creation_input_tokens".to_string(),
+                serde_json::json!(v),
+            );
+        }
+        if let Some(server_tool_use) = &usage.server_tool_use {
+            obj.insert(
+                "server_tool_use".to_string(),
+                serde_json::json!({
+                    "web_search_requests": server_tool_use.web_search_requests,
+                    "web_fetch_requests": server_tool_use.web_fetch_requests,
+                }),
+            );
+        }
+    }
+
+    value
 }

@@ -22,6 +22,8 @@ pub(crate) struct ResolvedModel {
     pub(crate) name: String,
     pub(crate) context_window: Option<u64>,
     pub(crate) supports_reasoning: bool,
+    pub(crate) supports_vision: bool,
+    pub(crate) supports_search: bool,
     pub(crate) wire: WireProtocol,
 }
 
@@ -450,6 +452,8 @@ pub(crate) fn resolved_model_from(model: &ModelsDevModel, wire: WireProtocol) ->
         name: model.name.clone(),
         context_window: model_context_window(model),
         supports_reasoning: model_supports_reasoning(model),
+        supports_vision: false,
+        supports_search: false,
         wire,
     }
 }
@@ -496,6 +500,8 @@ fn resolve_github_copilot_model(
         name: model.name.clone(),
         context_window: model.context_window,
         supports_reasoning: model.supports_reasoning,
+        supports_vision: model.supports_vision,
+        supports_search: model.supports_search,
         wire: model.wire,
     })
 }
